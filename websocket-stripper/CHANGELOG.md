@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026.09.12.02 — 2026-09-12
+
+**Per-dashboard Lovelace resource trimming (`trim_resources`, default off).** Resources are
+instance-wide in HA: every kiosk downloads, parses and compiles every custom card in the
+install. Measured here: **45 resources, 21MB of JavaScript, for a wall panel that renders four
+custom card types**. Trimming took that panel to 8 resources / 2.5MB.
+
+Resources are matched by testing each dashboard's custom card types (and non-builtin icon
+prefixes) as substrings of the resource body. Scanning for `customElements.define()` is the
+obvious approach and the wrong one — large bundles build element names at runtime, so
+`mushroom.js` (639KB) exposes almost nothing that way and would be dropped from a dashboard
+that needs it.
+
+Off by default, because unlike a dropped entity a dropped resource is *visible*. Every drop is
+logged with its size, and `resources_always_forward` rescues frontend patchers and icon packs,
+which register no card and so cannot be detected by content. On the panel this was built
+against, `kiosk-mode` and the icon packs needed it; with those four restored the dashboard was
+pixel-identical to before, with 33 of 45 resources still dropped.
+
+**Honest note on the payoff:** removing 13-18MB of the 21MB did *not* reliably speed the panel
+up — 29.1s mean against 31.5s, inside the run-to-run spread. The CPU profile that motivated
+this (73% of main-thread busy time unattributed to script, style or layout) does not appear to
+have been module parsing after all. The feature is worth having for bandwidth, memory and
+sanity on a large install; do not expect it to transform load time.
+
+
 ## 2026.09.11.03 — 2026-09-11
 
 Both of these came out of a byte census of one real kiosk load (2,457.9KB over 72 frames).

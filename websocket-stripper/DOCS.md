@@ -15,6 +15,9 @@ uses, so kiosk/wall-panel pages load fast on large instances — with no loss of
 | `per_dashboard` | bool | `true` (default) serves each connection only the dashboard it is actually viewing, instead of the union of every dashboard in `dashboards`. A panel showing one dashboard stops paying for the others. The dashboard is inferred from the page request that immediately precedes the websocket; a connection that can't be attributed falls back to the union, so nothing is ever served *less* than it was before this option existed. **Limit:** navigating to another dashboard *without* a page reload keeps the allowlist the connection opened with, so that dashboard's own entities show as unavailable until reload — see below. `false` = always serve the union (pre-2026.09 behaviour). |
 | `trim_registries` | bool | `true` (default) also trims the entity/device/area registries to what the connection can see, **including `config/entity_registry/list_for_display`**, which is typically the single largest payload the frontend fetches (1.44MB of a 2.46MB load on a 9,553-entity instance). Once states are trimmed this is the largest remaining payload on a big instance — it is one row per entity for the *whole* install. Devices and areas are kept wherever a surviving entity still reaches them, so names and area assignments keep resolving. Turn this **off first** if names, areas or device links render oddly. |
 | `compress_websocket` | bool | `true` (default) negotiates `permessage-deflate` with the browser, as HA's own websocket does. The `ws` library does not enable this server-side by default, so without it this add-on *removes* compression that HA would have provided — kiosks receive plaintext JSON. Deflate runs on libuv's threadpool, not the main loop. Set `false` only on very weak hardware where the CPU costs more than the bytes saved. |
+| `trim_resources` | bool | `false` (default). Trims **Lovelace resources** (custom cards) per dashboard. Resources are instance-wide in HA, so every kiosk downloads and parses every custom card you have installed — 21MB of JavaScript for a 4-card wall panel on the instance this was built against. A resource is kept when the dashboard's card types (or non-builtin icon prefixes) appear in its file. **Off by default because a wrongly dropped resource is visible** as a card that won't render. Every drop is logged with its size. |
+| `resources_always_forward` | list | URL patterns (literal substring, e.g. `kiosk-mode`, or `/regex/`) always sent. Needed for plugins that patch the frontend instead of registering a card — they contain none of the dashboard's card names, so the content match cannot tell they're used. In practice: `kiosk-mode`, icon packs, and anything that restyles core cards. |
+| `resources_never_forward` | list | URL patterns never sent to any dashboard. Wins over `resources_always_forward`. |
 | `port` | int | Port the add-on listens on (default `8099`). Because it runs with `host_network: true`, this option is how you move it off `8099` — the **Network** tab can't remap a host-network port. Change it if `8099` collides with another add-on (e.g. Zigbee2MQTT). |
 | `ha_base` | string | Optional. Override the Home Assistant base URL the add-on proxies to (default `http://homeassistant:8123`). Set this if `host_network` is on and the internal `homeassistant` hostname doesn't resolve — e.g. `http://192.168.4.2:8123`. |
 | `allow_ws_url` | string | Optional. Override the websocket URL used once at startup to precompute the allowlist (default `ws://supervisor/core/websocket`). Set if `supervisor` doesn't resolve under `host_network` — e.g. `ws://192.168.4.2:8123/api/websocket` (also requires a token via `ALLOW_TOKEN`). |
@@ -148,6 +151,29 @@ entities in `always_forward` and open an issue.
   the add-on starts before core is listening.
 - Navigating (via the HA sidebar) to a dashboard **not** in `dashboards` will show its
   entities as unavailable; add it to the list if you want it served too.
+
+### Tuning `trim_resources`
+
+Turn it on, load each kiosk once, and read the add-on log — it prints what each dashboard
+needs and every resource it dropped, with sizes:
+
+```
+resources basement-stairs-panel needs: entity-progress-multi-feature, grid-layout, navbar-card, whisker-card
+resources basement-stairs-panel: 8/45 kept (2536KB), 37 dropped (18471KB)
+    drop   4570KB /hacsfiles/custom-brand-icons/custom-brand-icons.js
+    drop   3159KB /bambu_lab/ha-bambulab-cards.js
+```
+
+Then look at the dashboard. Anything that looks wrong goes in `resources_always_forward`.
+Two classes of plugin reliably need it, because neither registers a card the config names:
+
+- **Frontend patchers** — `kiosk-mode` (without it the HA header and sidebar reappear),
+  `custom-sidebar`, and anything that restyles core cards.
+- **Icon packs** — dropping them can blank icons across the dashboard.
+
+A note on judging the result: check that Home Assistant has **finished starting** before you
+decide a card is broken. During startup HA serves entities as unavailable, and tile features
+like `light-color-favorites` render empty — which looks exactly like a missing resource.
 
 ### Cross-dashboard navigation with `per_dashboard` on
 
