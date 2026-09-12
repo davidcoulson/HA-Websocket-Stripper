@@ -705,17 +705,39 @@ async function buildResources(rpc, keysByDash) {
     byDash.set(dash, keep);
     log(`  resources ${dash} needs: ${[...keys].sort().join(', ') || '(none)'}`);
     log(`  resources ${dash}: ${keep.size}/${rows.length} kept (${(keptB / 1024).toFixed(0)}KB), ${rows.length - keep.size} dropped (${(dropB / 1024).toFixed(0)}KB)`);
-    for (const r of rows) {
-      if (keep.has(r.url)) continue;
-      const kb = ((RESOURCE_CACHE.get(r.url)?.bytes || 0) / 1024).toFixed(0);
-      log(`      drop ${String(kb).padStart(6)}KB ${r.url.split('?')[0]}`);
-    }
   }
   RESOURCES_BY_DASH = byDash;
   const union = new Set();
   for (const keep of byDash.values()) for (const u of keep) union.add(u);
   RESOURCES_KEEP = union;
-  log(`  resources served (union of all dashboards): ${union.size}/${rows.length}`);
+
+  // Resources dropped by EVERY dashboard get their own warning, because this set is the
+  // exact signature of the one failure the tuning loop cannot catch.
+  //
+  // The documented way to tune this option is "load the dashboard and see what looks
+  // wrong". That works for a card that fails to render or an icon that goes blank. It does
+  // not work for a resource that registers no element and is named by no dashboard, but
+  // runs on load and subscribes to state — an idle-timeout, a camera pop-up, a heartbeat.
+  // Drop one of those and the dashboard is pixel-identical; only the behaviour stops, and
+  // nothing reports it on either side. (Reported by @ajguerre1 on #15, who lost a doorbell
+  // pop-up on 28 panels for three days to the same failure one level down, via entities.)
+  //
+  // The proxy cannot tell that class apart from a genuinely unused resource — but the
+  // reader can, instantly. So say which ones they are rather than burying them in the
+  // per-dashboard drop lists.
+  const droppedByAll = rows.filter((r) => !union.has(r.url));
+  log(`  resources served: ${union.size}/${rows.length} (union of all dashboards)`);
+  if (droppedByAll.length) {
+    const kb = droppedByAll.reduce((t, r) => t + (RESOURCE_CACHE.get(r.url)?.bytes || 0), 0) / 1024;
+    log(`  resources: ${droppedByAll.length} dropped by ALL dashboards (no dashboard references them), ${kb.toFixed(0)}KB.`);
+    log('    If any of these run on load rather than rendering a card — an idle timer, a');
+    log('    pop-up, a heartbeat — add them to resources_always_forward. Dropping one of');
+    log('    those is INVISIBLE: the dashboard renders normally and only the behaviour stops.');
+    for (const r of droppedByAll) {
+      const b = ((RESOURCE_CACHE.get(r.url)?.bytes || 0) / 1024).toFixed(0);
+      log(`      drop ${String(b).padStart(6)}KB ${r.url.split('?')[0]}`);
+    }
+  }
 }
 
 // NOTE: there is deliberately NO per-connection dashboard attribution here.

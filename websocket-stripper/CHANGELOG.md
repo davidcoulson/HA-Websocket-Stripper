@@ -2,6 +2,26 @@
 
 ## 2026.09.12.03 — 2026-09-12
 
+**Resources dropped by *every* dashboard are now called out separately in the log**, with
+guidance, because that set is the signature of the one failure the documented tuning loop
+cannot catch. "Load it and see what looks wrong" finds a card that won't render or an icon
+that goes blank. It does not find a resource that registers no element and is named by no
+dashboard, but runs on load and subscribes to state — an idle timer, a camera pop-up, a
+heartbeat. Drop one of those and the dashboard is pixel-identical; only the behaviour stops,
+silently, on both sides.
+
+`DOCS.md` now names that as a third class needing `resources_always_forward`, alongside
+frontend patchers and icon packs, and marks which classes are loud and which is silent. The
+default-off rationale is reworded accordingly: it was "off because mistakes are visible",
+which is the wrong reason — for this class mistakes are exactly as invisible as a dropped
+entity, which argues for the same default more strongly.
+
+Raised by @ajguerre1 on #15, from production: they lost a doorbell pop-up on 28 panels for
+three days to the same failure one level down, where entity scoping stripped the helpers a
+resident module read. Home Assistant's half kept working and the chime still played, so the
+house sounded normal while the screens did nothing.
+
+
 **Withdraws the per-connection scoping half of this branch in favour of PR #13**, which
 implements the same thing with a better attribution mechanism (the user resolved from the
 `auth` frame, rather than inferring the dashboard from the page GET that precedes the

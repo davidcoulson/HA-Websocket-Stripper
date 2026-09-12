@@ -14,7 +14,7 @@ uses, so kiosk/wall-panel pages load fast on large instances — with no loss of
 | `strip_entities` | bool | `true` (default) strips the websocket to the allowlist. `false` = full passthrough (for A/B comparison). |
 | `trim_registries` | bool | `true` (default) also trims the entity/device/area registries to what the connection can see, **including `config/entity_registry/list_for_display`**, which is typically the single largest payload the frontend fetches (1.44MB of a 2.46MB load on a 9,553-entity instance). Once states are trimmed this is the largest remaining payload on a big instance — it is one row per entity for the *whole* install. Devices and areas are kept wherever a surviving entity still reaches them, so names and area assignments keep resolving. Turn this **off first** if names, areas or device links render oddly. |
 | `compress_websocket` | bool | `true` (default) negotiates `permessage-deflate` with the browser, as HA's own websocket does. The `ws` library does not enable this server-side by default, so without it this add-on *removes* compression that HA would have provided — kiosks receive plaintext JSON. Deflate runs on libuv's threadpool, not the main loop. Set `false` only on very weak hardware where the CPU costs more than the bytes saved. |
-| `trim_resources` | bool | `false` (default). Trims **Lovelace resources** (custom cards) per dashboard. Resources are instance-wide in HA, so every kiosk downloads and parses every custom card you have installed — 21MB of JavaScript for a 4-card wall panel on the instance this was built against. A resource is kept when the dashboard's card types (or non-builtin icon prefixes) appear in its file. **Off by default because a wrongly dropped resource is visible** as a card that won't render. Every drop is logged with its size. |
+| `trim_resources` | bool | `false` (default). Trims **Lovelace resources** (custom cards) per dashboard. Resources are instance-wide in HA, so every kiosk downloads and parses every custom card you have installed — 21MB of JavaScript for a 4-card wall panel on the instance this was built against. A resource is kept when the dashboard's card types (or non-builtin icon prefixes) appear in its file. **Off by default**, and see the tuning section below before turning it on — some resources fail *silently* when dropped. Every drop is logged with its size. |
 | `resources_always_forward` | list | URL patterns (literal substring, e.g. `kiosk-mode`, or `/regex/`) always sent. Needed for plugins that patch the frontend instead of registering a card — they contain none of the dashboard's card names, so the content match cannot tell they're used. In practice: `kiosk-mode`, icon packs, and anything that restyles core cards. |
 | `resources_never_forward` | list | URL patterns never sent to any dashboard. Wins over `resources_always_forward`. |
 | `port` | int | Port the add-on listens on (default `8099`). Because it runs with `host_network: true`, this option is how you move it off `8099` — the **Network** tab can't remap a host-network port. Change it if `8099` collides with another add-on (e.g. Zigbee2MQTT). |
@@ -164,11 +164,37 @@ resources basement-stairs-panel: 8/45 kept (2536KB), 37 dropped (18471KB)
 ```
 
 Then look at the dashboard. Anything that looks wrong goes in `resources_always_forward`.
-Two classes of plugin reliably need it, because neither registers a card the config names:
+Three classes of plugin reliably need it, because none registers a card the config names.
+The first two announce themselves; **the third does not**:
 
 - **Frontend patchers** — `kiosk-mode` (without it the HA header and sidebar reappear),
-  `custom-sidebar`, and anything that restyles core cards.
-- **Icon packs** — dropping them can blank icons across the dashboard.
+  `custom-sidebar`, and anything that restyles core cards. Loud when missing.
+- **Icon packs** — dropping them can blank icons across the dashboard. Loud when missing.
+- **Resident behavioural modules** — resources that register no element and are named by no
+  dashboard, but run on load and subscribe to state: an idle return-to-home timer, a camera
+  pop-up, a heartbeat another system keys on. **Silent when missing.** The dashboard renders
+  pixel-identically; only the behaviour stops, and nothing reports it on either side.
+
+That third class is why "load it and see what looks wrong" is not sufficient on its own, and
+why this option stays off by default. It is a real failure, not a hypothetical: it was
+reported against this feature by someone who had already lost a doorbell pop-up on 28 panels
+for three days to the same failure one level down, where entity scoping stripped the helpers
+a resident module read. Home Assistant's half kept working, the chime still played, and the
+screens simply never lit up.
+
+**The log names this class for you.** Any resource dropped by *every* dashboard is either
+genuinely unused or a resident module about to go quietly inert — the proxy can't tell, but
+you can:
+
+```
+resources: 3 dropped by ALL dashboards (no dashboard references them), 78KB.
+  If any of these run on load rather than rendering a card — an idle timer, a
+  pop-up, a heartbeat — add them to resources_always_forward. Dropping one of
+  those is INVISIBLE: the dashboard renders normally and only the behaviour stops.
+    drop     30KB /local/panel-idle.js
+```
+
+Check that list before you decide the feature is working.
 
 A note on judging the result: check that Home Assistant has **finished starting** before you
 decide a card is broken. During startup HA serves entities as unavailable, and tile features

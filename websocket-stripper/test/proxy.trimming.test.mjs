@@ -164,6 +164,23 @@ describe('resource trimming', () => {
     } finally { px.kill(); await m2.close(); }
   });
 
+  // The one failure the documented tuning loop ("load it and see what looks wrong") cannot
+  // catch: a resource that registers no element and is named by no dashboard, but runs on
+  // load and subscribes to state. Dropping it leaves the dashboard pixel-identical and only
+  // stops the behaviour, so the log has to say which resources those could be.
+  it('names the resources dropped by EVERY dashboard, since those fail silently', async () => {
+    const p2 = await getFreePort();
+    const px = spawnProxy({ mock, dashPaths: 'res-dash', port: p2, extraEnv: { TRIM_RESOURCES: '1' } });
+    try {
+      await px.waitForLog(/drop\s+\d+KB \/res\/global-patcher\.js/);
+      const out = px.out;
+      assert.match(out, /dropped by ALL dashboards \(no dashboard references them\)/);
+      assert.match(out, /INVISIBLE/, 'the warning must say the failure is invisible');
+      assert.match(out, /resources_always_forward/, 'and name the option that fixes it');
+      assert.match(out, /\/res\/global-patcher\.js/, 'and list the offending resource');
+    } finally { px.kill(); }
+  });
+
   it('trim_resources off (the default) leaves the list untouched', async () => {
     const p2 = await getFreePort();
     const px = spawnProxy({ mock, dashPaths: 'res-dash', port: p2 });
