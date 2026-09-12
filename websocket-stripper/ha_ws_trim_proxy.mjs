@@ -42,7 +42,7 @@ const inAddon = !!process.env.SUPERVISOR_TOKEN;
 // Bump together with config.yaml `version`. Logged at boot so the add-on log shows exactly
 // which code is running — the only reliable way to tell a Rebuild actually picked up changes
 // (a local add-on bakes in whatever files are in the host's /addons folder, not GitHub).
-const VERSION = '2026.09.12.01';
+const VERSION = '2026.09.12.02';
 
 const toList = (v) => (Array.isArray(v) ? v : String(v ?? '').split(/[\n,]/))
   .map((s) => String(s).trim()).filter(Boolean);
@@ -625,6 +625,13 @@ let RESOURCES_BY_DASH = new Map();    // dash -> Set(url) to keep
 // scan finds almost nothing and would drop a resource the dashboard needs. The literal name
 // is still present in the bundle, so a substring test finds it. Errs toward keeping — a false
 // positive costs bytes, a false negative breaks a card.
+// Both halves of the icon pattern must START WITH A LETTER, and keys shorter than
+// MIN_KEY are discarded. That is not fussiness — a loose pattern here silently disables the
+// whole feature. `16:9` (a picture card's aspect_ratio) and `06:00` (any schedule) match a
+// digit-tolerant pattern and yield the keys "16" and "06", and a two-character string occurs
+// in every minified bundle ever written, so every resource "matches" and nothing is dropped.
+// Observed exactly that: 45 resources, 39 kept, 97KB saved instead of 18MB.
+const MIN_KEY = 3;
 function resourceKeys(cfg) {
   const keys = new Set();
   (function walk(n) {
@@ -632,9 +639,10 @@ function resourceKeys(cfg) {
     if (n && typeof n === 'object') return Object.values(n).forEach(walk);
     if (typeof n !== 'string') return;
     if (n.startsWith('custom:')) keys.add(n.slice(7));
-    const ic = n.match(/^([a-z0-9][a-z0-9_-]*):[a-z0-9][a-z0-9-]*$/);
+    const ic = n.match(/^([a-z][a-z0-9_]{2,15}):([a-z][a-z0-9-]*)$/);
     if (ic && !BUILTIN_ICON_NS.has(ic[1])) keys.add(ic[1]);
   })(cfg);
+  for (const k of keys) if (k.length < MIN_KEY) keys.delete(k);
   return keys;
 }
 
@@ -694,6 +702,7 @@ async function buildResources(rpc, keysByDash) {
       else dropB += bytes;
     }
     byDash.set(dash, keep);
+    log(`  resources ${dash} needs: ${[...keys].sort().join(', ') || '(none)'}`);
     log(`  resources ${dash}: ${keep.size}/${rows.length} kept (${(keptB / 1024).toFixed(0)}KB), ${rows.length - keep.size} dropped (${(dropB / 1024).toFixed(0)}KB)`);
     for (const r of rows) {
       if (keep.has(r.url)) continue;

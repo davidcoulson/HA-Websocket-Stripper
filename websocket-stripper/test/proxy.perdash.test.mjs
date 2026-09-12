@@ -211,6 +211,30 @@ describe('resource trimming', () => {
     assert.ok(!urls.includes('/res/unrelated-widget.js'), 'a card no view references must be dropped');
   });
 
+  // Regression: a loose icon-prefix pattern turns `16:9` and `06:00` into the keys "16" and
+// "06", and a 2-char string appears in every minified bundle — so everything matches and
+  // nothing is dropped. That silently disabled the whole feature (39/45 kept, 97KB saved).
+  it('is not fooled by aspect ratios and times into keeping everything', async () => {
+    // The entity matters: with none, the allowlist is empty and the proxy rightly refuses the
+    // websocket with 503, which fails this test for an unrelated reason.
+    const cfg = { views: [{ cards: [
+      { type: 'custom:my-fancy-card', entity: 'light.living_room', aspect_ratio: '16:9', schedule: '06:00' },
+    ] }] };
+    const m2 = await startMockHa({ configs: { 'ratio-dash': cfg } });
+    const p2 = await getFreePort();
+    const px = spawnProxy({ mock: m2, dashPaths: 'ratio-dash', port: p2, extraEnv: { TRIM_RESOURCES: '1' } });
+    try {
+      await px.waitForLog(/union allowlist for/);
+      const urls = await resourcesFor(p2, '/ratio-dash');
+      assert.ok(!urls.includes('/res/unrelated-widget.js'),
+        'an aspect_ratio must not become a match-everything key');
+    } finally {
+      // finally, not trailing statements: a throw above otherwise leaks the proxy and mock,
+      // and the open handles hang the whole test FILE rather than failing one test.
+      px.kill(); await m2.close();
+    }
+  });
+
   it('resources_always_forward rescues a global plugin that registers no card', async () => {
     const p2 = await getFreePort();
     const px = spawnProxy({ mock, dashPaths: 'res-dash', port: p2, extraEnv: { TRIM_RESOURCES: '1', RESOURCES_ALWAYS_FORWARD: 'global-patcher' } });
