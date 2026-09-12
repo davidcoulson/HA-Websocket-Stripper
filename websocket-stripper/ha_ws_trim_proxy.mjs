@@ -42,7 +42,7 @@ const inAddon = !!process.env.SUPERVISOR_TOKEN;
 // Bump together with config.yaml `version`. Logged at boot so the add-on log shows exactly
 // which code is running — the only reliable way to tell a Rebuild actually picked up changes
 // (a local add-on bakes in whatever files are in the host's /addons folder, not GitHub).
-const VERSION = '2026.09.11.03';
+const VERSION = '2026.09.12.01';
 
 const toList = (v) => (Array.isArray(v) ? v : String(v ?? '').split(/[\n,]/))
   .map((s) => String(s).trim()).filter(Boolean);
@@ -65,6 +65,20 @@ const STRIP = OPT.strip_entities !== undefined ? !!OPT.strip_entities
 // host, which is why it can be turned off on very weak hardware.
 const COMPRESS_WS = OPT.compress_websocket !== undefined ? !!OPT.compress_websocket
   : (process.env.COMPRESS_WS ?? '1') !== '0';
+
+// Lovelace resources are instance-wide: HA has no per-dashboard scoping, so every kiosk
+// downloads, parses and compiles EVERY custom card in the install. Measured on the instance
+// this was built against: 45 resources, 21MB of JavaScript, for a wall panel that uses four
+// custom card types. With states and registries already trimmed, this is what the load time
+// actually consists of — ~73% of the main thread's busy time is module parse/compile, not
+// script execution, style or layout.
+//
+// Off by default. Unlike entity trimming, a wrongly dropped resource is *visible* — a card
+// renders as "Custom element doesn't exist" — so this is opt-in, and every drop is logged.
+const TRIM_RESOURCES = OPT.trim_resources !== undefined ? !!OPT.trim_resources
+  : (process.env.TRIM_RESOURCES ?? '0') !== '0';
+const RES_ALWAYS = parseRules(OPT.resources_always_forward ?? process.env.RESOURCES_ALWAYS_FORWARD);
+const RES_NEVER = parseRules(OPT.resources_never_forward ?? process.env.RESOURCES_NEVER_FORWARD);
 
 // allowlist-precompute connection (add-on: supervisor proxy + SUPERVISOR_TOKEN)
 const ALLOW_WS_URL = process.env.ALLOW_WS_URL || OPT.allow_ws_url || (inAddon ? 'ws://supervisor/core/websocket' : HA_WS);
@@ -260,6 +274,7 @@ async function buildAllow(rpc, renderTemplate) {
   const registries = await fetchRegistries(rpc);
   const union = new Set();
   const perDash = new Map();
+  const keysByDash = new Map();
   let failed = 0;
   for (const p of DASH_PATHS) {
     try {
@@ -268,6 +283,7 @@ async function buildAllow(rpc, renderTemplate) {
       const set = allowlistFor(cfg, states, registries, tpls);
       log(`  ${p}: ${set.size} entities`);
       perDash.set(p, set);
+      keysByDash.set(p, resourceKeys(cfg));
       set.forEach((e) => union.add(e));
     } catch (e) { failed++; log(`  ${p}: FAILED ${e.message}`); }
   }
@@ -293,6 +309,7 @@ async function buildAllow(rpc, renderTemplate) {
     rebuildRegCache(registries, withOverrides);
     log(`  registry reach: ${REG_CACHE.devices.size} device(s), ${REG_CACHE.areas.size} area(s)`);
   }
+  await buildResources(rpc, keysByDash);
   const afterAlways = new Set([...union, ...withOverrides]).size;
   log(`overrides: base ${baseN}, +always ${afterAlways - baseN}, -never ${afterAlways - withOverrides.size}`);
   if (PER_DASH) log(`  per-dashboard: ${[...perDash].map(([p, s]) => `${p}=${s.size}`).join(', ')} (union ${withOverrides.size})`);
@@ -592,6 +609,101 @@ function rebuildRegCache(registries, allow) {
   REG_CACHE.areas = areas;
 }
 
+// ---- per-dashboard Lovelace resources ----
+// Namespaces the frontend resolves itself; an `mdi:` icon needs no custom resource.
+const BUILTIN_ICON_NS = new Set(['mdi', 'hass', 'hassio', 'homeassistant', 'custom']);
+
+const RESOURCE_CACHE = new Map();     // url -> { tested:Set, present:Set|null, bytes }
+let RESOURCES_BY_DASH = new Map();    // dash -> Set(url) to keep
+
+// Every token a dashboard might need a resource FOR: `custom:x` card/row/badge/feature types,
+// and icon-pack prefixes (`foo:bar` where foo isn't built in).
+//
+// These are matched as plain substrings against each resource's body rather than by scanning
+// for `customElements.define(...)`. That looks like the rigorous approach and is in fact the
+// broken one: big bundles (mushroom, 639KB) construct element names at runtime, so a define()
+// scan finds almost nothing and would drop a resource the dashboard needs. The literal name
+// is still present in the bundle, so a substring test finds it. Errs toward keeping — a false
+// positive costs bytes, a false negative breaks a card.
+function resourceKeys(cfg) {
+  const keys = new Set();
+  (function walk(n) {
+    if (Array.isArray(n)) return n.forEach(walk);
+    if (n && typeof n === 'object') return Object.values(n).forEach(walk);
+    if (typeof n !== 'string') return;
+    if (n.startsWith('custom:')) keys.add(n.slice(7));
+    const ic = n.match(/^([a-z0-9][a-z0-9_-]*):[a-z0-9][a-z0-9-]*$/);
+    if (ic && !BUILTIN_ICON_NS.has(ic[1])) keys.add(ic[1]);
+  })(cfg);
+  return keys;
+}
+
+// never > always > content match > fail-open. A resource we could not read is always kept:
+// being unable to check is not evidence it is unused.
+// Resource rules match on a SUBSTRING of the URL, not the whole of it — unlike entity rules,
+// which compare entity_ids exactly. Nobody wants to write out
+// `/hacsfiles/kiosk-mode/kiosk-mode.js?hacstag=1234567890`; they want to write `kiosk-mode`.
+const matchesUrl = (rules, url) => rules.some((r) => (r.re ? r.re.test(url) : url.includes(r.literal)));
+
+function keepResource(url, keys) {
+  if (matchesUrl(RES_NEVER, url)) return false;
+  if (matchesUrl(RES_ALWAYS, url)) return true;
+  const c = RESOURCE_CACHE.get(url);
+  if (!c || c.present === null) return true;
+  for (const k of keys) if (c.present.has(k)) return true;
+  return false;
+}
+
+async function buildResources(rpc, keysByDash) {
+  if (!TRIM_RESOURCES) return;
+  let rows;
+  try { rows = await rpc({ type: 'lovelace/resources' }); }
+  catch (e) { log(`  resources: FAILED (${e.message}) — forwarding all resources`); RESOURCES_BY_DASH = new Map(); return; }
+  if (!Array.isArray(rows)) { RESOURCES_BY_DASH = new Map(); return; }
+
+  const unionKeys = new Set();
+  for (const ks of keysByDash.values()) ks.forEach((k) => unionKeys.add(k));
+  // One fetch per resource, tested against every dashboard's keys at once. Bodies are read
+  // and discarded one at a time — the whole set is ~21MB on a large install and must not be
+  // held in memory. The cache is keyed by URL, which carries HACS's version tag, so an
+  // updated card re-fetches on its own.
+  for (const r of rows) {
+    const c = RESOURCE_CACHE.get(r.url);
+    if (c && [...unionKeys].every((k) => c.tested.has(k))) continue;
+    try {
+      const abs = /^https?:/i.test(r.url) ? r.url : HA_BASE + r.url;
+      const body = await (await fetch(abs, { signal: AbortSignal.timeout(20000) })).text();
+      RESOURCE_CACHE.set(r.url, {
+        tested: new Set(unionKeys),
+        present: new Set([...unionKeys].filter((k) => body.includes(k))),
+        bytes: body.length,
+      });
+    } catch (e) {
+      RESOURCE_CACHE.set(r.url, { tested: new Set(unionKeys), present: null, bytes: 0 });
+      logThrottled(`res:${r.url}`, `  resources: could not read ${r.url} (${e.message}) — always forwarding it`);
+    }
+  }
+
+  const byDash = new Map();
+  for (const [dash, keys] of keysByDash) {
+    const keep = new Set();
+    let keptB = 0, dropB = 0;
+    for (const r of rows) {
+      const bytes = RESOURCE_CACHE.get(r.url)?.bytes || 0;
+      if (keepResource(r.url, keys)) { keep.add(r.url); keptB += bytes; }
+      else dropB += bytes;
+    }
+    byDash.set(dash, keep);
+    log(`  resources ${dash}: ${keep.size}/${rows.length} kept (${(keptB / 1024).toFixed(0)}KB), ${rows.length - keep.size} dropped (${(dropB / 1024).toFixed(0)}KB)`);
+    for (const r of rows) {
+      if (keep.has(r.url)) continue;
+      const kb = ((RESOURCE_CACHE.get(r.url)?.bytes || 0) / 1024).toFixed(0);
+      log(`      drop ${String(kb).padStart(6)}KB ${r.url.split('?')[0]}`);
+    }
+  }
+  RESOURCES_BY_DASH = byDash;
+}
+
 // ---- which dashboard is this client looking at? ----
 // The websocket upgrade itself carries nothing that identifies the dashboard: the frontend
 // opens ONE /api/websocket for the whole SPA and only asks for `lovelace/config` later —
@@ -719,6 +831,7 @@ function bridge(browserWs, allow = ALLOW, dash = null) {
   const getStatesIds = new Set();
   const subEntityIds = new Set();   // subscribe_entities subs we injected the allowlist into
   const registryIds = new Map();    // request id -> which registry, to trim its result
+  const resourceIds = new Set();    // lovelace/resources requests, to trim their result
   const queue = []; let haOpen = false;
   const toHA = (s) => { if (haOpen) haWs.send(s); else queue.push(s); };
 
@@ -729,6 +842,7 @@ function bridge(browserWs, allow = ALLOW, dash = null) {
     try { m = JSON.parse(s); } catch { return toHA(s); }
     if (STRIP && m && m.type === 'get_states') getStatesIds.add(m.id);
     if (STRIP && TRIM_REGISTRIES && m && REGISTRY_TYPES.has(m.type)) registryIds.set(m.id, REGISTRY_TYPES.get(m.type));
+    if (STRIP && TRIM_RESOURCES && m && m.type === 'lovelace/resources') resourceIds.add(m.id);
     if (STRIP && m && m.type === 'subscribe_entities' && !m.entity_ids) {
       // Belt-and-braces to the upgrade gate: an empty entity_ids is NOT "subscribe to
       // nothing", it's "no filter" (HA: `set(msg["entity_ids"]) or None`). Sending one would
@@ -789,6 +903,22 @@ function bridge(browserWs, allow = ALLOW, dash = null) {
         logThrottled(`reg:${kind}`, `${kind} registry trimmed ${before} -> ${after}${dash ? ` (${dash})` : ''}`);
       }
     }
+    // Lovelace resources, trimmed to the ones this dashboard actually needs. Only ever for a
+    // connection we attributed to a dashboard: an unattributed connection gets the union of
+    // entities, and must likewise get every resource — guessing wrong here renders a card as
+    // "Custom element doesn't exist", which is far worse than sending bytes it won't use.
+    if (STRIP && TRIM_RESOURCES && m && m.type === 'result' && resourceIds.has(m.id) && Array.isArray(m.result)) {
+      resourceIds.delete(m.id);
+      const keep = dash ? RESOURCES_BY_DASH.get(dash) : null;
+      if (keep?.size) {
+        const before = m.result.length;
+        m.result = m.result.filter((r) => keep.has(r?.url));
+        if (m.result.length !== before) {
+          s = JSON.stringify(m);
+          logThrottled('resources', `lovelace resources trimmed ${before} -> ${m.result.length} (${dash})`);
+        }
+      }
+    }
     // Defensive egress filter (belt-and-suspenders): HA already trims to the injected
     // entity_ids, so this is normally a no-op. But if a future HA ever ignored that
     // filter, re-filter the subscribe_entities event payload to the allowlist here so
@@ -823,7 +953,7 @@ function bridge(browserWs, allow = ALLOW, dash = null) {
 // ---- boot ----
 log(`ha-ws-trim-proxy v${VERSION} starting`);
 log(`mode: ${inAddon ? 'add-on' : 'dev'} | target ${HA_BASE} | allowlist via ${ALLOW_WS_URL}`);
-log(`options: per_dashboard=${PER_DASH} trim_registries=${TRIM_REGISTRIES} compress_websocket=${COMPRESS_WS}`);
+log(`options: per_dashboard=${PER_DASH} trim_registries=${TRIM_REGISTRIES} compress_websocket=${COMPRESS_WS} trim_resources=${TRIM_RESOURCES}`);
 // Listen FIRST, before HA is known to be reachable. The add-on and HA core restart together
 // (host boot, a core update), and core can take minutes to answer — the proxy's job is to
 // wait for it, not to exit. HTTP proxies through immediately (502 while HA is down, like any

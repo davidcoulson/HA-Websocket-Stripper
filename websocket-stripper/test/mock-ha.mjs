@@ -22,6 +22,14 @@ const DEFAULT_CONFIGS = { 'test-dash': DASH_TEST, 'auto-dash': DASH_AUTO };
 // render_template bodies, keyed by the template source the config asks for.
 const DEFAULT_TEMPLATES = { PV_TEMPLATE: "[{'entity': 'sensor.pv_roof_power'}, {'entity': 'sensor.pv_shed_power'}]" };
 
+// The mock's HTTP handler answers 'MOCK_HA_BODY <url>', so a resource whose URL contains a
+// card type behaves like a bundle that defines it — which is what the content match tests.
+const DEFAULT_RESOURCES = [
+  { id: 'r1', type: 'module', url: '/res/my-fancy-card.js' },
+  { id: 'r2', type: 'module', url: '/res/unrelated-widget.js' },
+  { id: 'r3', type: 'module', url: '/res/global-patcher.js' },
+];
+
 const DEFAULT_REGISTRIES = {
   'config/area_registry/list': AREAS,
   'config/device_registry/list': DEVICES,
@@ -32,7 +40,7 @@ const DEFAULT_REGISTRIES = {
 
 // `port` pins the listen port so a test can take HA down and bring it back on the same
 // address — i.e. simulate an HA restart under a running proxy.
-export async function startMockHa({ configs = DEFAULT_CONFIGS, states = STATES, registries = DEFAULT_REGISTRIES, templates = DEFAULT_TEMPLATES, port: fixedPort } = {}) {
+export async function startMockHa({ configs = DEFAULT_CONFIGS, states = STATES, registries = DEFAULT_REGISTRIES, templates = DEFAULT_TEMPLATES, resources = DEFAULT_RESOURCES, port: fixedPort } = {}) {
   const port = fixedPort ?? await getFreePort();
   configs = { ...configs };    // per-mock copy, so a setConfig() in one test can't leak into the next
   const state = {
@@ -91,6 +99,7 @@ export async function startMockHa({ configs = DEFAULT_CONFIGS, states = STATES, 
       if (m.type in registries) return ok(registries[m.type]);   // config/*_registry/list
       switch (m.type) {
         case 'get_states': return ok(states);
+        case 'lovelace/resources': return ok(resources);
         case 'lovelace/config': {
           const cfg = configs[m.url_path];
           if (!cfg) return ws.send(JSON.stringify({ id: m.id, type: 'result', success: false, error: { code: 'not_found', message: m.url_path } }));

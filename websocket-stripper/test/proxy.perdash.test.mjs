@@ -181,6 +181,64 @@ describe('websocket compression', () => {
   });
 });
 
+// Lovelace resources are instance-wide in HA, so every kiosk parses every custom card in the
+// install — the largest remaining cost once states and registries are trimmed.
+describe('resource trimming', () => {
+  let mock, proxy, port;
+  // A dashboard whose only custom card is `custom:my-fancy-card`.
+  const CFG = { views: [{ cards: [{ type: 'custom:my-fancy-card', entity: 'light.living_room' }] }] };
+
+  before(async () => {
+    mock = await startMockHa({ configs: { 'res-dash': CFG } });
+    port = await getFreePort();
+    proxy = spawnProxy({ mock, dashPaths: 'res-dash', port, extraEnv: { TRIM_RESOURCES: '1' } });
+    await proxy.waitForLog(/union allowlist for/);
+  });
+  after(async () => { proxy.kill(); await mock.close(); });
+
+  const resourcesFor = async (p, pageUrl) => {
+    if (pageUrl) await httpGet(`http://127.0.0.1:${p}${pageUrl}`);
+    const c = haClient(`ws://127.0.0.1:${p}/api/websocket`);
+    await c.authed;
+    const rows = (await c.rpc({ type: 'lovelace/resources' })).result;
+    c.close();
+    return rows.map((r) => r.url);
+  };
+
+  it('keeps the resource providing a card the dashboard uses, drops the rest', async () => {
+    const urls = await resourcesFor(port, '/res-dash');
+    assert.ok(urls.includes('/res/my-fancy-card.js'), 'the card this dashboard renders must survive');
+    assert.ok(!urls.includes('/res/unrelated-widget.js'), 'a card no view references must be dropped');
+  });
+
+  it('resources_always_forward rescues a global plugin that registers no card', async () => {
+    const p2 = await getFreePort();
+    const px = spawnProxy({ mock, dashPaths: 'res-dash', port: p2, extraEnv: { TRIM_RESOURCES: '1', RESOURCES_ALWAYS_FORWARD: 'global-patcher' } });
+    await px.waitForLog(/union allowlist for/);
+    const urls = await resourcesFor(p2, '/res-dash');
+    px.kill();
+    assert.ok(urls.includes('/res/global-patcher.js'), 'always_forward must win over the content match');
+  });
+
+  it('an unattributed connection still gets every resource', async () => {
+    const p2 = await getFreePort();
+    const px = spawnProxy({ mock, dashPaths: 'res-dash', port: p2, extraEnv: { TRIM_RESOURCES: '1' } });
+    await px.waitForLog(/union allowlist for/);
+    const urls = await resourcesFor(p2, null);   // no page GET -> no dashboard attribution
+    px.kill();
+    assert.equal(urls.length, 3, 'a connection we cannot attribute must not have resources removed');
+  });
+
+  it('trim_resources off (the default) leaves the list untouched', async () => {
+    const p2 = await getFreePort();
+    const px = spawnProxy({ mock, dashPaths: 'res-dash', port: p2 });
+    await px.waitForLog(/union allowlist for/);
+    const urls = await resourcesFor(p2, '/res-dash');
+    px.kill();
+    assert.equal(urls.length, 3);
+  });
+});
+
 describe('registry trimming', () => {
   let mock, proxy, port;
   before(async () => {

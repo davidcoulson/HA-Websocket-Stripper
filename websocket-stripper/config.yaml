@@ -1,5 +1,5 @@
 name: WebSocket Stripper
-version: "2026.09.11.03"
+version: "2026.09.12.01"
 slug: websocket_stripper
 stage: stable
 description: Serves your real HA dashboards but trims the entity websocket to only what each dashboard uses — fast kiosk loads, full fidelity.
@@ -46,6 +46,19 @@ options:
   # from the browser leg. On by default to restore that. Turn off only on very weak hardware
   # where deflate CPU costs more than the bytes it saves.
   compress_websocket: true
+  # Trim Lovelace resources (custom cards) per dashboard. Resources are instance-wide in HA,
+  # so every kiosk parses EVERY custom card you have installed — 21MB of JavaScript for a
+  # 4-card wall panel on the instance this was built against. Off by default: unlike entity
+  # trimming, a wrongly dropped resource is visible as "Custom element doesn't exist". Every
+  # drop is logged with its size, so turn it on, watch one load, and add anything that breaks
+  # to resources_always_forward.
+  trim_resources: false
+  # URL patterns (literal substring or /regex/) always sent, whatever the content match says.
+  # Needed for global plugins that patch the frontend rather than registering a card — they
+  # contain none of the dashboard's card names, so the match cannot see that they are used.
+  resources_always_forward: []
+  # URL patterns never sent to any dashboard. Wins over always.
+  resources_never_forward: []
   port: 8099
   ha_base: ""
   allow_ws_url: ""
@@ -60,6 +73,11 @@ schema:
   per_dashboard: bool
   trim_registries: bool
   compress_websocket: bool
+  trim_resources: bool
+  resources_always_forward:
+    - str
+  resources_never_forward:
+    - str
   port: "int(1,65535)?"
   ha_base: "str?"
   allow_ws_url: "str?"
