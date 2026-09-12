@@ -42,7 +42,7 @@ const inAddon = !!process.env.SUPERVISOR_TOKEN;
 // Bump together with config.yaml `version`. Logged at boot so the add-on log shows exactly
 // which code is running — the only reliable way to tell a Rebuild actually picked up changes
 // (a local add-on bakes in whatever files are in the host's /addons folder, not GitHub).
-const VERSION = '2026.09.11.01';
+const VERSION = '2026.09.11.02';
 
 const toList = (v) => (Array.isArray(v) ? v : String(v ?? '').split(/[\n,]/))
   .map((s) => String(s).trim()).filter(Boolean);
@@ -587,10 +587,15 @@ function rebuildRegCache(registries, allow) {
 // case is exactly the old behaviour.
 //
 // Keyed by IP, which is right for wall panels (one device, one dashboard, static address)
-// and deliberately coarse: two browsers behind one NAT would share a hint. Both still work —
-// the loser just gets the other's dashboard until its own `lovelace/config` corrects it
-// (see the bridge). Per-IP because a kiosk has no cookies we can rely on and no session we
+// and deliberately coarse: two browsers behind one NAT share a hint, so the one that loaded
+// second wins and the other may see entities its dashboard doesn't cover as unavailable
+// until it reloads. Per-IP because a kiosk has no cookies we can rely on and no session we
 // can see; a cookie would be finer-grained but needs a response rewrite on every page load.
+//
+// The page GET is the ONLY signal used. `lovelace/config` looks like a better one — it names
+// the dashboard explicitly — but requesting a dashboard's config does not mean displaying
+// it: Kiosk Satellite enumerates every dashboard's views at startup. See the note in
+// bridge() for what happened when this code tried to act on it.
 const CLIENT_DASH_TTL_MS = 10 * 60 * 1000;
 const clientDash = new Map();                 // ip -> { path, at }
 
@@ -670,7 +675,7 @@ server.on('upgrade', (req, socket, head) => {
     }
     const { set, dash } = allowFor(req);
     if (dash) log(`/api/websocket for ${clientIp(req)}: serving ${dash} (${set.size} entities, union is ${ALLOW.size})`);
-    wss.handleUpgrade(req, socket, head, (browserWs) => bridge(browserWs, set, dash, clientIp(req)));
+    wss.handleUpgrade(req, socket, head, (browserWs) => bridge(browserWs, set, dash));
   } else {
     // Keyed on the path, not req.url: camera stream URLs carry a per-request signature, so
     // keying on the whole thing would defeat the throttle (and grow the map) during a retry storm.
@@ -682,7 +687,7 @@ server.on('upgrade', (req, socket, head) => {
 // `allow` is THIS connection's allowlist — one dashboard's, or the union when the client
 // couldn't be attributed. Captured per bridge rather than read from the global, so two
 // kiosks on different dashboards get genuinely different subscriptions.
-function bridge(browserWs, allow = ALLOW, dash = null, ip = '') {
+function bridge(browserWs, allow = ALLOW, dash = null) {
   const haWs = new WebSocket(HA_WS, { perMessageDeflate: true, maxPayload: 0 });
   const getStatesIds = new Set();
   const subEntityIds = new Set();   // subscribe_entities subs we injected the allowlist into
@@ -709,24 +714,20 @@ function bridge(browserWs, allow = ALLOW, dash = null, ip = '') {
       subEntityIds.add(m.id);              // remember it, to defensively re-filter its events
       s = JSON.stringify(m);
     }
-    // The SPA can navigate between dashboards without reopening the websocket, so a
-    // connection opened for dashboard A can end up displaying B — whose entities A's
-    // allowlist may not contain. `lovelace/config` is the frontend telling us exactly which
-    // dashboard it is about to render, so use it to correct the IP hint and recycle the
-    // socket: the frontend reconnects on its own and re-subscribes against B.
+    // NB: `lovelace/config` is deliberately NOT used to re-attribute a live connection.
     //
-    // Only when B actually needs something A lacks. Reconnecting on every config fetch would
-    // loop forever; this terminates because after the reconnect the hint already says B.
-    if (STRIP && PER_DASH && m && m.type === 'lovelace/config' && m.url_path && m.url_path !== dash) {
-      const want = ALLOW_BY_DASH.get(m.url_path);
-      if (want?.size && [...want].some((e) => !allow.has(e))) {
-        if (ip) clientDash.set(ip, { path: m.url_path, at: Date.now() });
-        log(`client ${ip || '?'} navigated ${dash ?? '(union)'} -> ${m.url_path}; reconnecting for its ${want.size}-entity allowlist`);
-        toHA(s);                            // let this config request through first
-        setTimeout(close, 0);               // then recycle; the frontend reconnects itself
-        return;
-      }
-    }
+    // It looks like the perfect signal — the frontend naming the dashboard it is about to
+    // render — but a client fetching a dashboard's config does not mean it is DISPLAYING
+    // that dashboard. Kiosk Satellite, for one, enumerates every dashboard's views at
+    // startup, so a panel showing `basement-stairs-panel` requests the config of all five.
+    // Acting on that flipped the stored hint to whichever dashboard was enumerated last and
+    // recycled the socket to "follow" it, which produced a reconnect storm and then served
+    // the panel the wrong dashboard's allowlist. Observed live, 2026-09-11.
+    //
+    // The page GET that precedes the websocket is the only signal that actually means "this
+    // client is displaying this dashboard", so it is the only one used. The cost is that a
+    // client-side navigation to a DIFFERENT dashboard keeps the old allowlist until the page
+    // reloads; set `per_dashboard: false` if that matters more than the trimming does.
     if (m && m.type === 'unsubscribe_events' && m.subscription != null) subEntityIds.delete(m.subscription);
     toHA(s);
   });

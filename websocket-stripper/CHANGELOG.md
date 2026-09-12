@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026.09.11.02 — 2026-09-11
+
+**Fix: reconnect storm when a client enumerates dashboards.** `2026.09.11.01` treated a
+`lovelace/config` request as the client announcing which dashboard it was about to render,
+correcting the stored hint and recycling the socket to follow it. That is wrong: requesting a
+dashboard's config does not mean displaying it. Kiosk Satellite enumerates *every* dashboard's
+views at startup, so a panel showing one dashboard requests the config of all five. The hint
+flipped to whichever was enumerated last, the socket recycled, the reconnect enumerated again —
+four `/api/websocket` connections in four seconds, and the panel then served the wrong
+dashboard's allowlist. One measured load never completed inside 70s.
+
+The page GET is now the only signal used to attribute a connection, because it is the only one
+that actually means "this client is displaying this dashboard".
+
+The cost is that a client-side navigation to a *different* dashboard keeps the allowlist it
+connected with until the page reloads, so entities unique to the new dashboard render as
+unavailable. Set `per_dashboard: false` to serve every connection the union if that matters
+more than the trimming does.
+
 ## 2026.09.11.01 — 2026-09-11
 
 Versioning moves to `yyyy.mm.dd.xx`.
