@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026.09.11.01 — 2026-09-11
+
+Versioning moves to `yyyy.mm.dd.xx`.
+
+**Per-dashboard allowlists (`per_dashboard`, default on).** Every connection used to get the
+*union* of all configured dashboards. On the instance this was developed against that union
+was 388 entities while the kiosk's own dashboard needed 60 — so a small wall panel paid for
+five dashboards to display one. Each connection is now served only its own dashboard's
+entities.
+
+The dashboard has to be known *before* the socket opens, because `subscribe_entities` is the
+message being rewritten and the frontend only asks for `lovelace/config` afterwards. What
+does arrive first is the ordinary page GET (`/basement-stairs-panel/basement`) on the same
+client IP, so that is what attributes the connection. A client that can't be attributed falls
+back to the union, i.e. exactly the previous behaviour — this option can only ever serve a
+connection *less*, never *less than it needs*.
+
+The SPA can also navigate between dashboards without reopening the websocket. When a
+connection asks for a `lovelace/config` belonging to a dashboard its allowlist doesn't cover,
+the hint is corrected and the socket recycled; the frontend reconnects itself and
+re-subscribes, the same mechanism an allowlist growth already used.
+
+`always_forward` / `never_forward` are now applied **per dashboard** rather than only to the
+union — `always_forward` exists for entities no card names (Assist pipeline and wake-word
+entities behind a Voice Satellite card, say), and those are needed on whichever dashboard the
+kiosk actually has open.
+
+**Registry trimming (`trim_registries`, default on).** The entity registry is one row per
+entity for the entire instance and, once states are trimmed, the largest thing left that
+scales with instance size rather than with what the dashboard shows. It is now cut to the
+entities the connection can see, with devices and areas kept wherever a surviving entity
+still reaches them so names and area assignments still resolve. Unrecognised registry shapes
+pass through untouched rather than being guessed at.
+
 ## 0.2.3 — 2026-08-23
 
 Filter resolution and reverse-proxy fixes, all from reported issues.
