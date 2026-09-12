@@ -42,7 +42,7 @@ const inAddon = !!process.env.SUPERVISOR_TOKEN;
 // Bump together with config.yaml `version`. Logged at boot so the add-on log shows exactly
 // which code is running — the only reliable way to tell a Rebuild actually picked up changes
 // (a local add-on bakes in whatever files are in the host's /addons folder, not GitHub).
-const VERSION = '2026.09.11.02';
+const VERSION = '2026.09.11.03';
 
 const toList = (v) => (Array.isArray(v) ? v : String(v ?? '').split(/[\n,]/))
   .map((s) => String(s).trim()).filter(Boolean);
@@ -58,6 +58,13 @@ const DASH_PATHS = toList(OPT.dashboards ?? (process.env.DASH_PATHS || process.e
 //   false = pass the websocket straight through (full firehose) for A/B comparison.
 const STRIP = OPT.strip_entities !== undefined ? !!OPT.strip_entities
   : (process.env.STRIP_ENTITIES ?? process.env.TRIM) !== '0';
+// HA's own websocket negotiates permessage-deflate. `ws` does NOT enable it server-side by
+// default, so simply putting this proxy in front of HA silently REMOVED compression from the
+// browser leg — the kiosk went from deflated frames to plaintext JSON over wifi. Default on
+// to restore what clients had before the proxy existed; the cost is deflate CPU on the HA
+// host, which is why it can be turned off on very weak hardware.
+const COMPRESS_WS = OPT.compress_websocket !== undefined ? !!OPT.compress_websocket
+  : (process.env.COMPRESS_WS ?? '1') !== '0';
 
 // allowlist-precompute connection (add-on: supervisor proxy + SUPERVISOR_TOKEN)
 const ALLOW_WS_URL = process.env.ALLOW_WS_URL || OPT.allow_ws_url || (inAddon ? 'ws://supervisor/core/websocket' : HA_WS);
@@ -537,13 +544,24 @@ const REGISTRY_TYPES = new Map([
 // card's "Kitchen / Ceiling Light" secondary text keeps resolving. Rows we don't understand
 // are kept — over-including is harmless, under-including breaks names.
 function trimRegistry(kind, rows, allow) {
-  if (kind === 'entity' || kind === 'entity_display') {
-    // Only a plain array of rows carrying entity_id is understood. `list_for_display` has
-    // returned other shapes across HA versions, and a shape we don't recognise is passed
-    // through untouched rather than guessed at.
-    if (!rows.every((r) => r && typeof r === 'object' && 'entity_id' in r)) return rows;
+  // `list_for_display` is NOT a list. It answers with an object — `{entity_categories,
+  // entities}` — whose rows use two-letter keys (`ei` entity_id, `di` device_id, `ai`
+  // area_id, `en` name, `pl` platform...). Measured on a 9,553-entity instance it is
+  // 1.44MB, and it was the single largest thing the kiosk still downloaded: 58% of the
+  // whole websocket load, because the array-shaped guard below passed it straight through.
+  // Filter `entities` and leave `entity_categories` (a tiny id->name map) alone.
+  if (kind === 'entity_display') {
+    const list = rows?.entities;
+    if (!Array.isArray(list) || !list.every((r) => r && typeof r === 'object' && 'ei' in r)) return rows;
+    return { ...rows, entities: list.filter((r) => allow.has(r.ei)) };
+  }
+  if (kind === 'entity') {
+    // Rows we don't understand are kept: over-including is harmless, under-including
+    // breaks names.
+    if (!Array.isArray(rows) || !rows.every((r) => r && typeof r === 'object' && 'entity_id' in r)) return rows;
     return rows.filter((r) => allow.has(r.entity_id));
   }
+  if (!Array.isArray(rows)) return rows;
   // Devices and areas are kept only where a surviving entity still reaches them, so a tile's
   // "Kitchen — Ceiling Light" secondary text still resolves. The reachable sets come from
   // REG_CACHE, built alongside the allowlist; if it's empty we haven't got a registry yet and
@@ -646,7 +664,16 @@ const server = http.createServer((req, res) => { noteClientDash(req); proxy.web(
 // upgrade passes straight through to HA — notably /api/webrtc/ws (go2rtc / WebRTC & MSE
 // camera-stream signaling) and Assist-pipeline sockets. Destroying them (the old default
 // branch) broke camera streams with ws close code 1006.
-const wss = new WebSocketServer({ noServer: true });
+// threshold: don't spend CPU deflating the small control chatter; the payloads that matter
+// here (registries, get_states, get_services) are hundreds of KB and compress ~10x.
+// concurrencyLimit caps simultaneous zlib jobs so a burst of kiosks reconnecting at once
+// can't saturate the host. Context takeover is left at the default (on) because this add-on
+// serves a handful of long-lived kiosk connections, where the better ratio is worth the
+// per-connection zlib memory.
+const wss = new WebSocketServer({
+  noServer: true,
+  perMessageDeflate: COMPRESS_WS ? { threshold: 1024, concurrencyLimit: 10 } : false,
+});
 server.on('upgrade', (req, socket, head) => {
   // A raw upgrade socket arrives with NO 'error' listener, and http-proxy only attaches one
   // once HA has answered 101 (see ws-incoming.js). Anything that errors in that window — an
@@ -747,14 +774,19 @@ function bridge(browserWs, allow = ALLOW, dash = null) {
     // dwarfing the states we just trimmed to a few hundred. Cut it to the entities this
     // connection can actually see, plus the devices/areas those rows still reference so
     // names and area assignments keep resolving.
-    if (STRIP && TRIM_REGISTRIES && m && m.type === 'result' && registryIds.has(m.id) && Array.isArray(m.result)) {
+    // Note the guard is on `m.result` being an object of ANY shape, not on it being an
+    // array: `list_for_display` answers with `{entity_categories, entities}`, and an
+    // Array.isArray() guard here silently skipped the largest payload of the lot.
+    if (STRIP && TRIM_REGISTRIES && m && m.type === 'result' && registryIds.has(m.id) && m.result && typeof m.result === 'object') {
       const kind = registryIds.get(m.id);
       registryIds.delete(m.id);
-      const before = m.result.length;
+      const rowsOf = (r) => (Array.isArray(r) ? r.length : (Array.isArray(r?.entities) ? r.entities.length : -1));
+      const before = rowsOf(m.result);
       m.result = trimRegistry(kind, m.result, allow);
-      if (m.result.length !== before) {
+      const after = rowsOf(m.result);
+      if (after !== before) {
         s = JSON.stringify(m);
-        logThrottled(`reg:${kind}`, `${kind} registry trimmed ${before} -> ${m.result.length}${dash ? ` (${dash})` : ''}`);
+        logThrottled(`reg:${kind}`, `${kind} registry trimmed ${before} -> ${after}${dash ? ` (${dash})` : ''}`);
       }
     }
     // Defensive egress filter (belt-and-suspenders): HA already trims to the injected
@@ -791,6 +823,7 @@ function bridge(browserWs, allow = ALLOW, dash = null) {
 // ---- boot ----
 log(`ha-ws-trim-proxy v${VERSION} starting`);
 log(`mode: ${inAddon ? 'add-on' : 'dev'} | target ${HA_BASE} | allowlist via ${ALLOW_WS_URL}`);
+log(`options: per_dashboard=${PER_DASH} trim_registries=${TRIM_REGISTRIES} compress_websocket=${COMPRESS_WS}`);
 // Listen FIRST, before HA is known to be reachable. The add-on and HA core restart together
 // (host boot, a core update), and core can take minutes to answer — the proxy's job is to
 // wait for it, not to exit. HTTP proxies through immediately (502 while HA is down, like any

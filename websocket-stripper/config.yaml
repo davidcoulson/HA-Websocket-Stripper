@@ -1,5 +1,5 @@
 name: WebSocket Stripper
-version: "2026.09.11.02"
+version: "2026.09.11.03"
 slug: websocket_stripper
 stage: stable
 description: Serves your real HA dashboards but trims the entity websocket to only what each dashboard uses — fast kiosk loads, full fidelity.
@@ -41,6 +41,11 @@ options:
   # larger payload on a big instance once states are trimmed. Turn OFF first if names, areas
   # or device links render oddly.
   trim_registries: true
+  # HA's own websocket negotiates permessage-deflate; the `ws` library does not do so
+  # server-side by default, so putting this proxy in front of HA silently removed compression
+  # from the browser leg. On by default to restore that. Turn off only on very weak hardware
+  # where deflate CPU costs more than the bytes it saves.
+  compress_websocket: true
   port: 8099
   ha_base: ""
   allow_ws_url: ""
@@ -54,6 +59,7 @@ schema:
   strip_entities: bool
   per_dashboard: bool
   trim_registries: bool
+  compress_websocket: bool
   port: "int(1,65535)?"
   ha_base: "str?"
   allow_ws_url: "str?"

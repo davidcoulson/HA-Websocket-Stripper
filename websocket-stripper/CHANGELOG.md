@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026.09.11.03 — 2026-09-11
+
+Both of these came out of a byte census of one real kiosk load (2,457.9KB over 72 frames).
+
+**`config/entity_registry/list_for_display` is now trimmed — it is the largest payload the
+frontend fetches.** It was passing through whole: 1,437.9KB, 58% of the entire websocket
+load, more than everything else combined. The trim missed it because `list_for_display`, in
+spite of the name, does not answer with a list — it answers with an object,
+`{entity_categories, entities}`, whose rows use two-letter keys (`ei` for entity_id, `di`
+device, `ai` area). The result guard tested `Array.isArray(m.result)` and skipped it in
+silence. Now 9,533 rows -> 100 on the panel this was found on.
+
+**Websocket compression restored (`compress_websocket`, default on).** HA's own websocket
+negotiates `permessage-deflate`; the `ws` library does **not** enable it server-side by
+default. So putting this proxy in front of HA silently *removed* compression from the browser
+leg — kiosks went from deflated frames to plaintext JSON over wifi. Verified by comparing the
+negotiated `Sec-WebSocket-Extensions` on HA directly (`permessage-deflate`) against the proxy
+(nothing). Deflate runs on libuv's threadpool rather than the main loop, and is capped with
+`concurrencyLimit`; turn it off on very weak hardware.
+
+Measured on the NSPanel Pro these were found on: 33.2/31.7/33.9s before, 31.2/30.7/32.7s
+after. The payload fell by roughly an order of magnitude but wall-clock barely moved, which
+is itself the useful result — what remains of that ~31s is not websocket bytes.
+
 ## 2026.09.11.02 — 2026-09-11
 
 **Fix: reconnect storm when a client enumerates dashboards.** `2026.09.11.01` treated a
