@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026.09.12.03 — 2026-09-12
+
+**Withdraws the per-connection scoping half of this branch in favour of PR #13**, which
+implements the same thing with a better attribution mechanism (the user resolved from the
+`auth` frame, rather than inferring the dashboard from the page GET that precedes the
+websocket, keyed by client IP) and 49-panel production validation. The `per_dashboard`
+option is gone.
+
+What remains does not depend on *how* a connection is scoped — registry and resource
+trimming both cut to whatever allowlist the connection ended up with, so they narrow on
+their own once per-connection scoping lands.
+
+With no scoping, resources are served as the union of every configured dashboard's keep
+set: the proxy cannot know which dashboard a socket is showing, and serving less would
+break whichever one it turns out to be. Resources that **no** dashboard references are
+still dropped.
+
+
 ## 2026.09.12.02 — 2026-09-12
 
 **Per-dashboard Lovelace resource trimming (`trim_resources`, default off).** Resources are

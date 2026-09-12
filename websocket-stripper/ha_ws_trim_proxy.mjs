@@ -42,7 +42,7 @@ const inAddon = !!process.env.SUPERVISOR_TOKEN;
 // Bump together with config.yaml `version`. Logged at boot so the add-on log shows exactly
 // which code is running — the only reliable way to tell a Rebuild actually picked up changes
 // (a local add-on bakes in whatever files are in the host's /addons folder, not GitHub).
-const VERSION = '2026.09.12.02';
+const VERSION = '2026.09.12.03';
 
 const toList = (v) => (Array.isArray(v) ? v : String(v ?? '').split(/[\n,]/))
   .map((s) => String(s).trim()).filter(Boolean);
@@ -162,11 +162,7 @@ let ALLOW = new Set();
 // instance this was built against the union was 388 entities while the kiosk's own dashboard
 // needed 60, so the union costs a small panel ~6x more state than it can display.
 let ALLOW_BY_DASH = new Map();
-// per_dashboard: serve each connection only its own dashboard's entities. Off => every
 // connection gets the union (the pre-2026.09 behaviour), which is also the automatic
-// fallback whenever a connection can't be attributed.
-const PER_DASH = OPT.per_dashboard !== undefined ? !!OPT.per_dashboard
-  : (process.env.PER_DASHBOARD ?? '1') !== '0';
 // trim_registries: also cut the entity/device/area registries to what the connection can
 // see. Separate from strip_entities because it is the more invasive of the two — states are
 // self-describing, whereas a registry row missing here makes the frontend treat the entity as
@@ -312,7 +308,6 @@ async function buildAllow(rpc, renderTemplate) {
   await buildResources(rpc, keysByDash);
   const afterAlways = new Set([...union, ...withOverrides]).size;
   log(`overrides: base ${baseN}, +always ${afterAlways - baseN}, -never ${afterAlways - withOverrides.size}`);
-  if (PER_DASH) log(`  per-dashboard: ${[...perDash].map(([p, s]) => `${p}=${s.size}`).join(', ')} (union ${withOverrides.size})`);
   return { union: withOverrides, perDash };
 }
 
@@ -615,6 +610,12 @@ const BUILTIN_ICON_NS = new Set(['mdi', 'hass', 'hassio', 'homeassistant', 'cust
 
 const RESOURCE_CACHE = new Map();     // url -> { tested:Set, present:Set|null, bytes }
 let RESOURCES_BY_DASH = new Map();    // dash -> Set(url) to keep
+// What a connection is actually served: the union of every configured dashboard's keep
+// set. Without per-connection scoping the proxy cannot know which dashboard a socket is
+// showing, and serving less than the union would break whichever one it turns out to be.
+// This still drops every resource NO dashboard references. It narrows to a single
+// dashboard's set once per-connection scoping (PR #13) lands.
+let RESOURCES_KEEP = new Set();
 
 // Every token a dashboard might need a resource FOR: `custom:x` card/row/badge/feature types,
 // and icon-pack prefixes (`foo:bar` where foo isn't built in).
@@ -666,8 +667,8 @@ async function buildResources(rpc, keysByDash) {
   if (!TRIM_RESOURCES) return;
   let rows;
   try { rows = await rpc({ type: 'lovelace/resources' }); }
-  catch (e) { log(`  resources: FAILED (${e.message}) — forwarding all resources`); RESOURCES_BY_DASH = new Map(); return; }
-  if (!Array.isArray(rows)) { RESOURCES_BY_DASH = new Map(); return; }
+  catch (e) { log(`  resources: FAILED (${e.message}) — forwarding all resources`); RESOURCES_BY_DASH = new Map(); RESOURCES_KEEP = new Set(); return; }
+  if (!Array.isArray(rows)) { RESOURCES_BY_DASH = new Map(); RESOURCES_KEEP = new Set(); return; }
 
   const unionKeys = new Set();
   for (const ks of keysByDash.values()) ks.forEach((k) => unionKeys.add(k));
@@ -711,74 +712,22 @@ async function buildResources(rpc, keysByDash) {
     }
   }
   RESOURCES_BY_DASH = byDash;
+  const union = new Set();
+  for (const keep of byDash.values()) for (const u of keep) union.add(u);
+  RESOURCES_KEEP = union;
+  log(`  resources served (union of all dashboards): ${union.size}/${rows.length}`);
 }
 
-// ---- which dashboard is this client looking at? ----
-// The websocket upgrade itself carries nothing that identifies the dashboard: the frontend
-// opens ONE /api/websocket for the whole SPA and only asks for `lovelace/config` later —
-// after `subscribe_entities`, which is the message we have to rewrite. So the dashboard has
-// to be known BEFORE the socket opens.
-//
-// What does arrive first is the ordinary HTTP GET for the dashboard page itself
-// (`GET /basement-stairs-panel/basement`), milliseconds earlier on the same connection's
-// client IP. Remembering that gives the upgrade a reliable hint without touching the
-// frontend or HA. When the hint is missing or stale we fall back to the union, so the worst
-// case is exactly the old behaviour.
-//
-// Keyed by IP, which is right for wall panels (one device, one dashboard, static address)
-// and deliberately coarse: two browsers behind one NAT share a hint, so the one that loaded
-// second wins and the other may see entities its dashboard doesn't cover as unavailable
-// until it reloads. Per-IP because a kiosk has no cookies we can rely on and no session we
-// can see; a cookie would be finer-grained but needs a response rewrite on every page load.
-//
-// The page GET is the ONLY signal used. `lovelace/config` looks like a better one — it names
-// the dashboard explicitly — but requesting a dashboard's config does not mean displaying
-// it: Kiosk Satellite enumerates every dashboard's views at startup. See the note in
-// bridge() for what happened when this code tried to act on it.
-const CLIENT_DASH_TTL_MS = 10 * 60 * 1000;
-const clientDash = new Map();                 // ip -> { path, at }
+// NOTE: there is deliberately NO per-connection dashboard attribution here.
+// An earlier version of this branch inferred it from the page GET preceding the
+// websocket, keyed by client IP. That is a heuristic — it breaks behind NAT, and a
+// client fetching a dashboard's config is not necessarily displaying it. PR #13
+// resolves the user from the `auth` frame the client actually presents, which is
+// strictly better, so this branch no longer competes with it. Everything below
+// trims to whatever allowlist the connection ends up with, so it narrows on its
+// own once per-connection scoping lands.
 
-const clientIp = (req) => String(
-  req.headers['x-forwarded-for']?.split(',')[0] || req.socket?.remoteAddress || ''
-).trim().replace(/^::ffff:/, '');
-
-// A dashboard URL is `/<url_path>` or `/<url_path>/<view>`. Match only configured
-// dashboards, so ordinary frontend traffic (/api/…, /static/…, /hacsfiles/…) is ignored.
-function dashFromUrl(url) {
-  const first = String(url || '').split('?')[0].split('/').filter(Boolean)[0];
-  if (!first) return null;
-  return DASH_PATHS.includes(first) ? first : null;
-}
-
-function noteClientDash(req) {
-  if (!PER_DASH) return;
-  const path = dashFromUrl(req.url);
-  if (!path) return;
-  const ip = clientIp(req);
-  if (!ip) return;
-  const prev = clientDash.get(ip);
-  clientDash.set(ip, { path, at: Date.now() });
-  if (prev?.path !== path) log(`client ${ip} -> dashboard ${path}`);
-  // Bounded: a busy instance must not accumulate an entry per client forever.
-  if (clientDash.size > 500) {
-    const cutoff = Date.now() - CLIENT_DASH_TTL_MS;
-    for (const [k, v] of clientDash) if (v.at < cutoff) clientDash.delete(k);
-  }
-}
-
-// The allowlist this connection should get: its own dashboard's if we know it and it is
-// non-empty, else the union. Never returns an empty set when the union has entries — an
-// empty entity_ids means "no filter" to HA, i.e. the whole firehose.
-function allowFor(req) {
-  if (!PER_DASH) return { set: ALLOW, dash: null };
-  const hit = clientDash.get(clientIp(req));
-  if (!hit || Date.now() - hit.at > CLIENT_DASH_TTL_MS) return { set: ALLOW, dash: null };
-  const set = ALLOW_BY_DASH.get(hit.path);
-  if (!set?.size) return { set: ALLOW, dash: null };
-  return { set, dash: hit.path };
-}
-
-const server = http.createServer((req, res) => { noteClientDash(req); proxy.web(req, res); });
+const server = http.createServer((req, res) => proxy.web(req, res));
 
 // ---- websocket upgrades ----
 // We intercept ONLY /api/websocket (the entity firehose) to trim it. EVERY other ws
@@ -821,9 +770,7 @@ server.on('upgrade', (req, socket, head) => {
       } catch { socket.destroy(); }
       return;
     }
-    const { set, dash } = allowFor(req);
-    if (dash) log(`/api/websocket for ${clientIp(req)}: serving ${dash} (${set.size} entities, union is ${ALLOW.size})`);
-    wss.handleUpgrade(req, socket, head, (browserWs) => bridge(browserWs, set, dash));
+    wss.handleUpgrade(req, socket, head, (browserWs) => bridge(browserWs));
   } else {
     // Keyed on the path, not req.url: camera stream URLs carry a per-request signature, so
     // keying on the whole thing would defeat the throttle (and grow the map) during a retry storm.
@@ -835,7 +782,7 @@ server.on('upgrade', (req, socket, head) => {
 // `allow` is THIS connection's allowlist — one dashboard's, or the union when the client
 // couldn't be attributed. Captured per bridge rather than read from the global, so two
 // kiosks on different dashboards get genuinely different subscriptions.
-function bridge(browserWs, allow = ALLOW, dash = null) {
+function bridge(browserWs, allow = ALLOW) {
   const haWs = new WebSocket(HA_WS, { perMessageDeflate: true, maxPayload: 0 });
   const getStatesIds = new Set();
   const subEntityIds = new Set();   // subscribe_entities subs we injected the allowlist into
@@ -890,7 +837,7 @@ function bridge(browserWs, allow = ALLOW, dash = null) {
       m.result = m.result.filter((e) => allow.has(e.entity_id));
       getStatesIds.delete(m.id);
       s = JSON.stringify(m);
-      log(`get_states trimmed ${before} -> ${m.result.length}${dash ? ` (${dash})` : ''}`);
+      log(`get_states trimmed ${before} -> ${m.result.length}`);
     }
     // Registry trimming. The entity registry is one row per entity for the WHOLE instance —
     // on a 9,553-entity install that is megabytes of JSON the kiosk parses on every load,
@@ -909,7 +856,7 @@ function bridge(browserWs, allow = ALLOW, dash = null) {
       const after = rowsOf(m.result);
       if (after !== before) {
         s = JSON.stringify(m);
-        logThrottled(`reg:${kind}`, `${kind} registry trimmed ${before} -> ${after}${dash ? ` (${dash})` : ''}`);
+        logThrottled(`reg:${kind}`, `${kind} registry trimmed ${before} -> ${after}`);
       }
     }
     // Lovelace resources, trimmed to the ones this dashboard actually needs. Only ever for a
@@ -918,13 +865,13 @@ function bridge(browserWs, allow = ALLOW, dash = null) {
     // "Custom element doesn't exist", which is far worse than sending bytes it won't use.
     if (STRIP && TRIM_RESOURCES && m && m.type === 'result' && resourceIds.has(m.id) && Array.isArray(m.result)) {
       resourceIds.delete(m.id);
-      const keep = dash ? RESOURCES_BY_DASH.get(dash) : null;
+      const keep = RESOURCES_KEEP;
       if (keep?.size) {
         const before = m.result.length;
         m.result = m.result.filter((r) => keep.has(r?.url));
         if (m.result.length !== before) {
           s = JSON.stringify(m);
-          logThrottled('resources', `lovelace resources trimmed ${before} -> ${m.result.length} (${dash})`);
+          logThrottled('resources', `lovelace resources trimmed ${before} -> ${m.result.length}`);
         }
       }
     }
@@ -962,7 +909,7 @@ function bridge(browserWs, allow = ALLOW, dash = null) {
 // ---- boot ----
 log(`ha-ws-trim-proxy v${VERSION} starting`);
 log(`mode: ${inAddon ? 'add-on' : 'dev'} | target ${HA_BASE} | allowlist via ${ALLOW_WS_URL}`);
-log(`options: per_dashboard=${PER_DASH} trim_registries=${TRIM_REGISTRIES} compress_websocket=${COMPRESS_WS} trim_resources=${TRIM_RESOURCES}`);
+log(`options: trim_registries=${TRIM_REGISTRIES} compress_websocket=${COMPRESS_WS} trim_resources=${TRIM_RESOURCES}`);
 // Listen FIRST, before HA is known to be reachable. The add-on and HA core restart together
 // (host boot, a core update), and core can take minutes to answer — the proxy's job is to
 // wait for it, not to exit. HTTP proxies through immediately (502 while HA is down, like any

@@ -12,7 +12,6 @@ uses, so kiosk/wall-panel pages load fast on large instances — with no loss of
 | `always_forward` | list | Entities to forward even if no listed dashboard uses them. Each item is a literal `entity_id` or a `/regex/` (matched against all entities). |
 | `never_forward` | list | Entities to never forward. Applied last — **wins** over `always_forward` and dashboard detection. Literal or `/regex/`. |
 | `strip_entities` | bool | `true` (default) strips the websocket to the allowlist. `false` = full passthrough (for A/B comparison). |
-| `per_dashboard` | bool | `true` (default) serves each connection only the dashboard it is actually viewing, instead of the union of every dashboard in `dashboards`. A panel showing one dashboard stops paying for the others. The dashboard is inferred from the page request that immediately precedes the websocket; a connection that can't be attributed falls back to the union, so nothing is ever served *less* than it was before this option existed. **Limit:** navigating to another dashboard *without* a page reload keeps the allowlist the connection opened with, so that dashboard's own entities show as unavailable until reload — see below. `false` = always serve the union (pre-2026.09 behaviour). |
 | `trim_registries` | bool | `true` (default) also trims the entity/device/area registries to what the connection can see, **including `config/entity_registry/list_for_display`**, which is typically the single largest payload the frontend fetches (1.44MB of a 2.46MB load on a 9,553-entity instance). Once states are trimmed this is the largest remaining payload on a big instance — it is one row per entity for the *whole* install. Devices and areas are kept wherever a surviving entity still reaches them, so names and area assignments keep resolving. Turn this **off first** if names, areas or device links render oddly. |
 | `compress_websocket` | bool | `true` (default) negotiates `permessage-deflate` with the browser, as HA's own websocket does. The `ws` library does not enable this server-side by default, so without it this add-on *removes* compression that HA would have provided — kiosks receive plaintext JSON. Deflate runs on libuv's threadpool, not the main loop. Set `false` only on very weak hardware where the CPU costs more than the bytes saved. |
 | `trim_resources` | bool | `false` (default). Trims **Lovelace resources** (custom cards) per dashboard. Resources are instance-wide in HA, so every kiosk downloads and parses every custom card you have installed — 21MB of JavaScript for a 4-card wall panel on the instance this was built against. A resource is kept when the dashboard's card types (or non-builtin icon prefixes) appear in its file. **Off by default because a wrongly dropped resource is visible** as a card that won't render. Every drop is logged with its size. |
@@ -175,17 +174,3 @@ A note on judging the result: check that Home Assistant has **finished starting*
 decide a card is broken. During startup HA serves entities as unavailable, and tile features
 like `light-color-favorites` render empty — which looks exactly like a missing resource.
 
-### Cross-dashboard navigation with `per_dashboard` on
-
-A connection is attributed to a dashboard by the page GET that precedes it, and keeps that
-allowlist for its whole life. Navigating to a **different** dashboard client-side — the HA
-sidebar, a `navigate` tap action, a navbar card — does not reopen the websocket, so entities
-unique to the new dashboard render as unavailable until the page reloads.
-
-This is deliberate. The obvious fix is to watch for `lovelace/config` and re-attribute the
-connection, but requesting a dashboard's config does not mean displaying it: Kiosk Satellite,
-for one, enumerates every dashboard's views at startup. Acting on that signal caused a
-reconnect storm and served panels the wrong allowlist (see `2026.09.11.02` in the changelog).
-
-If your panels navigate between dashboards, either set `per_dashboard: false` to serve the
-union, or make the navigation a full page load.
