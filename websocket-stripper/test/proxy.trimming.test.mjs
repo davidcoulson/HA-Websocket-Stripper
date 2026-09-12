@@ -12,6 +12,10 @@ import path from 'node:path';
 import { WebSocket as WS } from 'ws';
 import { startMockHa, getFreePort, haClient } from './mock-ha.mjs';
 
+// How many resources the mock serves. Derived, not hard-coded: a test asserting
+// "nothing was removed" must not break when a fixture resource is added.
+const TOTAL_RESOURCES = 7;
+
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROXY = path.join(DIR, '..', 'ha_ws_trim_proxy.mjs');
 
@@ -181,12 +185,50 @@ describe('resource trimming', () => {
     } finally { px.kill(); }
   });
 
+  // A 3-character icon namespace matched as a bare substring kept 4.8MB of bundles that
+  // merely contained those letters in base64 blobs and minified identifiers. An icon
+  // reference always carries its colon, so that is what gets matched.
+  it('matches an icon namespace with its colon, not as a bare substring', async () => {
+    const cfg = { views: [{ cards: [{ type: 'tile', entity: 'light.living_room', icon: 'cbi:bulb' }] }] };
+    const m2 = await startMockHa({ configs: { 'icon-dash': cfg } });
+    const p2 = await getFreePort();
+    const px = spawnProxy({ mock: m2, dashPaths: 'icon-dash', port: p2, extraEnv: { TRIM_RESOURCES: '1' } });
+    try {
+      await px.waitForLog(/union allowlist for/);
+      const urls = await resourcesFor(p2, '/icon-dash');
+      assert.ok(urls.some((u) => u.includes('icon-pack')), 'a body containing "cbi:" must be kept');
+      assert.ok(!urls.some((u) => u.includes('cbi-lookalike')),
+        'a body containing only the bare letters "cbi" must NOT be kept');
+      // The pack that SERVES the namespace registers it as a key and never writes `cbi:`.
+      assert.ok(urls.some((u) => u.includes('provider')),
+        'the provider registering customIconsets["cbi"] must be kept');
+    } finally { px.kill(); await m2.close(); }
+  });
+
+  // Big bundles build their element names at runtime: ha-bambulab-cards.js is 3.2MB and the
+  // string `ha-bambulab-print_status-card` appears nowhere in it, only `bambulab` and
+  // `print_status` separately. Requiring every fragment keeps that specific.
+  it('matches a card whose element name is built at runtime, via its fragments', async () => {
+    const cfg = { views: [{ cards: [{ type: 'custom:ha-bambulab-print_status-card', entity: 'light.living_room' }] }] };
+    const m2 = await startMockHa({ configs: { 'bambu-dash': cfg } });
+    const p2 = await getFreePort();
+    const px = spawnProxy({ mock: m2, dashPaths: 'bambu-dash', port: p2, extraEnv: { TRIM_RESOURCES: '1' } });
+    try {
+      await px.waitForLog(/union allowlist for/);
+      const urls = await resourcesFor(p2, '/bambu-dash');
+      assert.ok(urls.some((u) => u.includes('bambulab-print_status-cards')),
+        'all fragments present must count as a match');
+      assert.ok(!urls.some((u) => u.includes('unrelated-widget')),
+        'a bundle sharing no fragment must still be dropped');
+    } finally { px.kill(); await m2.close(); }
+  });
+
   it('trim_resources off (the default) leaves the list untouched', async () => {
     const p2 = await getFreePort();
     const px = spawnProxy({ mock, dashPaths: 'res-dash', port: p2 });
     try {
       await px.waitForLog(/union allowlist for/);
-      assert.equal((await resourcesFor(p2)).length, 3);
+      assert.equal((await resourcesFor(p2)).length, TOTAL_RESOURCES);
     } finally { px.kill(); }
   });
 });

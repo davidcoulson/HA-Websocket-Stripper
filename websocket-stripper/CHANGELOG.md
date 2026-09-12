@@ -1,41 +1,81 @@
 # Changelog
 
-## 2026.09.12.03 — 2026-09-12
+## 2026.09.12.07 — 2026-09-12
+
+Re-applies the withdrawal of the per-connection scoping half (see 2026.09.12.03) on top of
+the resource-matcher fixes below, so this branch carries the matcher work without duplicating
+the scoping that PR #13 implements better.
+
+
+## 2026.09.12.06 — 2026-09-12
+
+An icon namespace is matched **both** as `ns:` (how a user writes it) and as a registration
+key, `customIconsets["ns"]` (how the pack that serves it writes it — a provider never writes
+the colon form at all). Matching only the colon form dropped `custom-icons.js`, the provider
+of `cil:`, from every dashboard.
+
+Fragment distinctiveness is **measured**, not a stop-word list: document frequency across the
+resources actually read, with anything in more than a quarter of them disqualified. The first
+attempt used a hand-written list, and `grid`, `layout`, `entity` and `progress` slipped
+through it and matched nearly every bundle — taking one panel from 2,998KB to 11,876KB, four
+times worse than the bug being fixed.
+
+**Icon namespaces are matched with their colon, and card types can match by fragments.**
+Two bugs in the resource matcher, found by breaking down what one dashboard was actually
+keeping.
+
+*False positives.* A namespace was matched as a bare substring, so the 3-character `cbi`
+kept **4,818KB** of bundles that merely contained those letters — inside base64 blobs,
+minified identifiers, and one `cbid:`. `cbi:` appeared in none of them. An icon reference
+always carries its colon, so that is what is matched now.
+
+*False negatives, hidden by those false positives.* `ha-bambulab-cards.js` is 3.2MB and a
+dashboard renders `ha-bambulab-print_status-card` — a string that appears **nowhere** in the
+bundle, which builds its element names at runtime. It was being kept only by the accidental
+`cbi` hit. Tightening the icon match alone would therefore have broken those cards.
+
+So a card type now matches on its literal name *or*, failing that, on every one of its
+distinctive fragments (`bambulab` **and** `print_status`), requiring at least two so a single
+generic word can never carry a match on its own.
+
+
+## 2026.09.12.05 — 2026-09-12
+
+**Resource matching now reads the icons of the entities a dashboard shows, not just its
+config text.** An entity's icon normally lives in the entity registry, so a config-only scan
+never sees it and drops the icon pack that renders it. Measured here: 20 entities carry
+`phu:` icons set in the registry, and the string `phu` appears in no dashboard's YAML.
+
+Without this, keeping those icons working meant pinning the pack in
+`resources_always_forward` for every dashboard — 4,571KB on a panel that shows none of
+those 20 entities, 60% of its entire resource payload. With it, the pack is kept for the
+dashboards that show `phu:` entities and dropped for the ones that don't, automatically.
+
+
+## 2026.09.12.04 — 2026-09-12
 
 **Resources dropped by *every* dashboard are now called out separately in the log**, with
-guidance, because that set is the signature of the one failure the documented tuning loop
-cannot catch. "Load it and see what looks wrong" finds a card that won't render or an icon
-that goes blank. It does not find a resource that registers no element and is named by no
-dashboard, but runs on load and subscribes to state — an idle timer, a camera pop-up, a
-heartbeat. Drop one of those and the dashboard is pixel-identical; only the behaviour stops,
-silently, on both sides.
+guidance. That set is the signature of the one failure the documented tuning loop cannot
+catch: "load the dashboard and see what looks wrong" finds a card that won't render or an
+icon that goes blank, but not a resource that registers no element and is named by no
+dashboard, yet runs on load and subscribes to state — an idle timer, a camera pop-up, a
+heartbeat. Drop one of those and the dashboard is pixel-identical; only the behaviour stops.
 
-`DOCS.md` now names that as a third class needing `resources_always_forward`, alongside
-frontend patchers and icon packs, and marks which classes are loud and which is silent. The
-default-off rationale is reworded accordingly: it was "off because mistakes are visible",
-which is the wrong reason — for this class mistakes are exactly as invisible as a dropped
-entity, which argues for the same default more strongly.
+`DOCS.md` names that as a third class needing `resources_always_forward`, alongside frontend
+patchers and icon packs, and marks which are loud and which is silent.
 
-Raised by @ajguerre1 on #15, from production: they lost a doorbell pop-up on 28 panels for
-three days to the same failure one level down, where entity scoping stripped the helpers a
-resident module read. Home Assistant's half kept working and the chime still played, so the
-house sounded normal while the screens did nothing.
+Raised by @ajguerre1 reviewing the upstream PR, from production: they lost a doorbell pop-up
+on 28 panels for three days to the same failure one level down, where entity scoping stripped
+the helpers a resident module read. Home Assistant's half kept working and the chime still
+played, so the house sounded normal while the screens did nothing.
 
+The per-dashboard drop detail moved out of the per-dashboard loop into this one block —
+previously it printed every dropped URL once per dashboard, which on a six-dashboard instance
+was most of the startup log.
 
-**Withdraws the per-connection scoping half of this branch in favour of PR #13**, which
-implements the same thing with a better attribution mechanism (the user resolved from the
-`auth` frame, rather than inferring the dashboard from the page GET that precedes the
-websocket, keyed by client IP) and 49-panel production validation. The `per_dashboard`
-option is gone.
-
-What remains does not depend on *how* a connection is scoped — registry and resource
-trimming both cut to whatever allowlist the connection ended up with, so they narrow on
-their own once per-connection scoping lands.
-
-With no scoping, resources are served as the union of every configured dashboard's keep
-set: the proxy cannot know which dashboard a socket is showing, and serving less would
-break whichever one it turns out to be. Resources that **no** dashboard references are
-still dropped.
+**`per_dashboard` is retained here**, unlike on the upstream PR branch where it was withdrawn
+in favour of upstream #13. This fork is what the add-on is built from, and #13 is not merged,
+so removing it would serve every connection the union instead of its own dashboard.
 
 
 ## 2026.09.12.02 — 2026-09-12

@@ -28,7 +28,24 @@ const DEFAULT_RESOURCES = [
   { id: 'r1', type: 'module', url: '/res/my-fancy-card.js' },
   { id: 'r2', type: 'module', url: '/res/unrelated-widget.js' },
   { id: 'r3', type: 'module', url: '/res/global-patcher.js' },
+  // Body contains the bare letters "cbi" but never "cbi:" — the shape that made a
+  // 3-character icon namespace keep megabytes of unrelated bundles.
+  { id: 'r4', type: 'module', url: '/res/cbi-lookalike.js' },
+  // Body contains a real "cbi:" icon reference.
+  { id: 'r5', type: 'module', url: '/res/icon-pack.js' },
+  // A provider: registers the namespace as a key and never writes the colon form.
+  { id: 'r7', type: 'module', url: '/res/provider.js' },
+  // Never contains the literal element name, only its fragments — a bundle that builds
+  // `ha-bambulab-print_status-card` at runtime.
+  { id: 'r6', type: 'module', url: '/res/bambulab-print_status-cards.js' },
 ];
+
+// Bodies for resources whose content matters. An icon PACK registers its namespace as a
+// key and never writes `cbi:` anywhere, so matching only the colon form would drop it.
+const DEFAULT_RESOURCE_BODIES = {
+  '/res/provider.js': 'window.customIconsets["cbi"]={getIcon:n=>n};',
+  '/res/icon-pack.js': 'const sample="cbi:bulb";',
+};
 
 const DEFAULT_REGISTRIES = {
   'config/area_registry/list': AREAS,
@@ -40,7 +57,7 @@ const DEFAULT_REGISTRIES = {
 
 // `port` pins the listen port so a test can take HA down and bring it back on the same
 // address — i.e. simulate an HA restart under a running proxy.
-export async function startMockHa({ configs = DEFAULT_CONFIGS, states = STATES, registries = DEFAULT_REGISTRIES, templates = DEFAULT_TEMPLATES, resources = DEFAULT_RESOURCES, port: fixedPort } = {}) {
+export async function startMockHa({ configs = DEFAULT_CONFIGS, states = STATES, registries = DEFAULT_REGISTRIES, templates = DEFAULT_TEMPLATES, resources = DEFAULT_RESOURCES, resourceBodies = DEFAULT_RESOURCE_BODIES, port: fixedPort } = {}) {
   const port = fixedPort ?? await getFreePort();
   configs = { ...configs };    // per-mock copy, so a setConfig() in one test can't leak into the next
   const state = {
@@ -60,6 +77,13 @@ export async function startMockHa({ configs = DEFAULT_CONFIGS, states = STATES, 
     state.lastXFF = req.headers['x-forwarded-for'] ?? null;
     state.httpHits.push({ url: req.url, xff: state.lastXFF });
     res.setHeader('x-echo-xff', state.lastXFF ?? '');
+    // A resource with an explicit body, for tests that need real content rather than the
+    // echoed URL — quotes and colons do not survive a round trip through a URL.
+    const path = req.url.split('?')[0];
+    if (Object.prototype.hasOwnProperty.call(resourceBodies, path)) {
+      res.writeHead(200, { 'content-type': 'application/javascript' });
+      return res.end(resourceBodies[path]);
+    }
     res.writeHead(200, { 'content-type': 'text/plain' });
     res.end('MOCK_HA_BODY ' + req.url);
   });

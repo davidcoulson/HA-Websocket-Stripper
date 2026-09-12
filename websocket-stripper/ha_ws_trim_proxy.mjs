@@ -42,7 +42,7 @@ const inAddon = !!process.env.SUPERVISOR_TOKEN;
 // Bump together with config.yaml `version`. Logged at boot so the add-on log shows exactly
 // which code is running — the only reliable way to tell a Rebuild actually picked up changes
 // (a local add-on bakes in whatever files are in the host's /addons folder, not GitHub).
-const VERSION = '2026.09.12.03';
+const VERSION = '2026.09.12.07';
 
 const toList = (v) => (Array.isArray(v) ? v : String(v ?? '').split(/[\n,]/))
   .map((s) => String(s).trim()).filter(Boolean);
@@ -162,7 +162,6 @@ let ALLOW = new Set();
 // instance this was built against the union was 388 entities while the kiosk's own dashboard
 // needed 60, so the union costs a small panel ~6x more state than it can display.
 let ALLOW_BY_DASH = new Map();
-// connection gets the union (the pre-2026.09 behaviour), which is also the automatic
 // trim_registries: also cut the entity/device/area registries to what the connection can
 // see. Separate from strip_entities because it is the more invasive of the two — states are
 // self-describing, whereas a registry row missing here makes the frontend treat the entity as
@@ -267,6 +266,7 @@ function applyOverrides(set, realIds) {
 async function buildAllow(rpc, renderTemplate) {
   const states = await rpc({ type: 'get_states' });
   const realIds = states.map((s) => s.entity_id);
+  const byId = new Map(states.map((st) => [st.entity_id, st]));
   const registries = await fetchRegistries(rpc);
   const union = new Set();
   const perDash = new Map();
@@ -279,7 +279,12 @@ async function buildAllow(rpc, renderTemplate) {
       const set = allowlistFor(cfg, states, registries, tpls);
       log(`  ${p}: ${set.size} entities`);
       perDash.set(p, set);
-      keysByDash.set(p, resourceKeys(cfg));
+      // Resource keys come from the dashboard config AND from the icons of the entities
+      // this dashboard shows. The second half matters: an entity's icon usually lives in
+      // the entity registry, not in any dashboard's YAML, so a config-only scan misses it
+      // and drops the icon pack that renders it. Measured here: 20 entities carry `phu:`
+      // icons set in the registry, and the string "phu" appears in no dashboard config.
+      keysByDash.set(p, resourceKeys(cfg, set, byId));
       set.forEach((e) => union.add(e));
     } catch (e) { failed++; log(`  ${p}: FAILED ${e.message}`); }
   }
@@ -633,19 +638,74 @@ let RESOURCES_KEEP = new Set();
 // in every minified bundle ever written, so every resource "matches" and nothing is dropped.
 // Observed exactly that: 45 resources, 39 kept, 97KB saved instead of 18MB.
 const MIN_KEY = 3;
-function resourceKeys(cfg) {
-  const keys = new Set();
+function resourceKeys(cfg, allowed = null, byId = null) {
+  const cards = new Set();      // custom card/row/badge/feature types
+  const icons = new Set();      // non-builtin icon namespaces
+  const addIcon = (ns) => { if (ns.length >= MIN_KEY && !BUILTIN_ICON_NS.has(ns)) icons.add(ns); };
+  // Icons of the entities this dashboard actually shows, which are typically registry
+  // values rather than anything written in the config.
+  if (allowed && byId) {
+    for (const id of allowed) {
+      const ic = byId.get(id)?.attributes?.icon;
+      if (typeof ic !== 'string') continue;
+      const m = ic.match(/^([a-z][a-z0-9_]{2,15}):[a-z]/);
+      if (m) addIcon(m[1]);
+    }
+  }
   (function walk(n) {
     if (Array.isArray(n)) return n.forEach(walk);
     if (n && typeof n === 'object') return Object.values(n).forEach(walk);
     if (typeof n !== 'string') return;
-    if (n.startsWith('custom:')) keys.add(n.slice(7));
+    if (n.startsWith('custom:') && n.length > 7 + MIN_KEY) cards.add(n.slice(7));
     const ic = n.match(/^([a-z][a-z0-9_]{2,15}):([a-z][a-z0-9-]*)$/);
-    if (ic && !BUILTIN_ICON_NS.has(ic[1])) keys.add(ic[1]);
+    if (ic) addIcon(ic[1]);
   })(cfg);
-  for (const k of keys) if (k.length < MIN_KEY) keys.delete(k);
-  return keys;
+  return { cards, icons };
 }
+
+// A card type split into candidate identifying parts. Split on `-` only: an underscore
+// usually sits inside one meaningful word (`print_status`), and breaking it would leave
+// fragments generic enough to match anything.
+function cardFragments(type) {
+  return type.split('-').filter((p) => p.length >= 4);
+}
+
+// How many resources contain each fragment, and the cutoff above which a fragment is too
+// common to identify anything. MEASURED rather than a hand-maintained stop-word list: the
+// first attempt at this used one, and `grid`, `layout`, `entity` and `progress` all slipped
+// through it and matched nearly every bundle on the instance — which took one panel from
+// 2,998KB to 11,876KB. A fragment present in a quarter of all resources says nothing.
+let FRAG_DF = new Map();
+let FRAG_DF_MAX = 0;
+const isDistinctive = (f) => (FRAG_DF.get(f) || 0) <= FRAG_DF_MAX;
+
+// Does this body provide this card type?
+//
+// The literal name is the strong signal. The fragment fallback exists for bundles that
+// BUILD their element names at runtime: `ha-bambulab-cards.js` is 3.2MB, a dashboard
+// renders `ha-bambulab-print_status-card`, and that string appears nowhere in the file —
+// only `bambulab` and `print_status` separately. Every fragment must be present, and at
+// least two of them must be distinctive, so a pair of common words can never carry a match.
+function cardMatchesBody(type, cached) {
+  if (cached.literal.has(type)) return true;
+  const frags = cardFragments(type);
+  if (frags.length < 2) return false;
+  if (!frags.every((f) => cached.frags.has(f))) return false;
+  return frags.filter(isDistinctive).length >= 2;
+}
+
+// An icon namespace is matched two ways, and it needs both.
+//
+// A *user* of the namespace writes `cbi:bulb`, so the colon form finds them. Matching the
+// bare namespace instead is how the 3-character `cbi` came to keep 4.8MB of bundles that
+// merely contained those letters in base64 blobs and minified identifiers — `cbi:` appeared
+// in none of them.
+//
+// But the *provider* never writes the colon form at all: it registers the namespace as a
+// key, `customIconsets["cil"]`. Matching only the colon form drops the very bundle that
+// serves the icons, which is what happened to custom-icons.js, the provider of `cil:`.
+const ICON_REG = (ns) => new RegExp('customIcons(?:ets)?\\s*\\[\\s*[\'"`]' + ns + '[\'"`]');
+const bodyHasIcon = (body, ns) => body.includes(ns + ':') || ICON_REG(ns).test(body);
 
 // never > always > content match > fail-open. A resource we could not read is always kept:
 // being unable to check is not evidence it is unused.
@@ -658,8 +718,9 @@ function keepResource(url, keys) {
   if (matchesUrl(RES_NEVER, url)) return false;
   if (matchesUrl(RES_ALWAYS, url)) return true;
   const c = RESOURCE_CACHE.get(url);
-  if (!c || c.present === null) return true;
-  for (const k of keys) if (c.present.has(k)) return true;
+  if (!c || c.unreadable) return true;            // cannot check, so keep
+  for (const k of keys.icons) if (c.icons.has(k)) return true;
+  for (const k of keys.cards) if (cardMatchesBody(k, c)) return true;
   return false;
 }
 
@@ -670,8 +731,18 @@ async function buildResources(rpc, keysByDash) {
   catch (e) { log(`  resources: FAILED (${e.message}) — forwarding all resources`); RESOURCES_BY_DASH = new Map(); RESOURCES_KEEP = new Set(); return; }
   if (!Array.isArray(rows)) { RESOURCES_BY_DASH = new Map(); RESOURCES_KEEP = new Set(); return; }
 
-  const unionKeys = new Set();
-  for (const ks of keysByDash.values()) ks.forEach((k) => unionKeys.add(k));
+  // Every token any dashboard could match on, tagged by kind so a card type and an icon
+  // namespace that happen to share a name can never be confused for one another.
+  const unionCards = new Set(), unionIcons = new Set();
+  for (const ks of keysByDash.values()) {
+    ks.cards.forEach((k) => unionCards.add(k));
+    ks.icons.forEach((k) => unionIcons.add(k));
+  }
+  const unionFrags = new Set();
+  for (const c of unionCards) for (const f of cardFragments(c)) unionFrags.add(f);
+  const unionKeys = new Set([...[...unionCards].map((k) => 'card:' + k),
+                             ...[...unionIcons].map((k) => 'icon:' + k),
+                             ...[...unionFrags].map((k) => 'frag:' + k)]);
   // One fetch per resource, tested against every dashboard's keys at once. Bodies are read
   // and discarded one at a time — the whole set is ~21MB on a large install and must not be
   // held in memory. The cache is keyed by URL, which carries HACS's version tag, so an
@@ -684,13 +755,29 @@ async function buildResources(rpc, keysByDash) {
       const body = await (await fetch(abs, { signal: AbortSignal.timeout(20000) })).text();
       RESOURCE_CACHE.set(r.url, {
         tested: new Set(unionKeys),
-        present: new Set([...unionKeys].filter((k) => body.includes(k))),
+        literal: new Set([...unionCards].filter((k) => body.includes(k))),
+        icons: new Set([...unionIcons].filter((k) => bodyHasIcon(body, k))),
+        frags: new Set([...unionFrags].filter((f) => body.includes(f))),
+        unreadable: false,
         bytes: body.length,
       });
     } catch (e) {
-      RESOURCE_CACHE.set(r.url, { tested: new Set(unionKeys), present: null, bytes: 0 });
+      RESOURCE_CACHE.set(r.url, { tested: new Set(unionKeys), literal: new Set(), icons: new Set(), frags: new Set(), unreadable: true, bytes: 0 });
       logThrottled(`res:${r.url}`, `  resources: could not read ${r.url} (${e.message}) — always forwarding it`);
     }
+  }
+
+  // Document frequency across the resources we could actually read. A fragment in more than
+  // a quarter of them identifies nothing, so it cannot carry a fragment match on its own.
+  const readable = rows.filter((r) => !RESOURCE_CACHE.get(r.url)?.unreadable);
+  FRAG_DF = new Map();
+  for (const f of unionFrags) {
+    FRAG_DF.set(f, readable.filter((r) => RESOURCE_CACHE.get(r.url).frags.has(f)).length);
+  }
+  FRAG_DF_MAX = Math.max(1, Math.floor(readable.length * 0.25));
+  const common = [...unionFrags].filter((f) => !isDistinctive(f));
+  if (common.length) {
+    log(`  resources: ${common.length} fragment(s) too common to identify a card (>${FRAG_DF_MAX} of ${readable.length}): ${common.sort().join(', ')}`);
   }
 
   const byDash = new Map();
@@ -703,13 +790,15 @@ async function buildResources(rpc, keysByDash) {
       else dropB += bytes;
     }
     byDash.set(dash, keep);
-    log(`  resources ${dash} needs: ${[...keys].sort().join(', ') || '(none)'}`);
+    const needs = [...[...keys.cards].sort(), ...[...keys.icons].sort().map((i) => i + ':')];
+    log(`  resources ${dash} needs: ${needs.join(', ') || '(none)'}`);
     log(`  resources ${dash}: ${keep.size}/${rows.length} kept (${(keptB / 1024).toFixed(0)}KB), ${rows.length - keep.size} dropped (${(dropB / 1024).toFixed(0)}KB)`);
   }
   RESOURCES_BY_DASH = byDash;
-  const union = new Set();
-  for (const keep of byDash.values()) for (const u of keep) union.add(u);
-  RESOURCES_KEEP = union;
+  const servedUnion = new Set();
+  for (const keep of byDash.values()) for (const u of keep) servedUnion.add(u);
+  RESOURCES_KEEP = servedUnion;
+  log(`  resources served: ${servedUnion.size}/${rows.length} (union of all dashboards)`);
 
   // Resources dropped by EVERY dashboard get their own warning, because this set is the
   // exact signature of the one failure the tuning loop cannot catch.
@@ -717,16 +806,18 @@ async function buildResources(rpc, keysByDash) {
   // The documented way to tune this option is "load the dashboard and see what looks
   // wrong". That works for a card that fails to render or an icon that goes blank. It does
   // not work for a resource that registers no element and is named by no dashboard, but
-  // runs on load and subscribes to state — an idle-timeout, a camera pop-up, a heartbeat.
+  // runs on load and subscribes to state — an idle timer, a camera pop-up, a heartbeat.
   // Drop one of those and the dashboard is pixel-identical; only the behaviour stops, and
-  // nothing reports it on either side. (Reported by @ajguerre1 on #15, who lost a doorbell
-  // pop-up on 28 panels for three days to the same failure one level down, via entities.)
+  // nothing reports it on either side. (Reported by @ajguerre1 on upstream #15, who lost a
+  // doorbell pop-up on 28 panels for three days to the same failure one level down, via
+  // entities.)
   //
   // The proxy cannot tell that class apart from a genuinely unused resource — but the
   // reader can, instantly. So say which ones they are rather than burying them in the
   // per-dashboard drop lists.
-  const droppedByAll = rows.filter((r) => !union.has(r.url));
-  log(`  resources served: ${union.size}/${rows.length} (union of all dashboards)`);
+  const servedAnywhere = new Set();
+  for (const keep of byDash.values()) for (const u of keep) servedAnywhere.add(u);
+  const droppedByAll = rows.filter((r) => !servedAnywhere.has(r.url));
   if (droppedByAll.length) {
     const kb = droppedByAll.reduce((t, r) => t + (RESOURCE_CACHE.get(r.url)?.bytes || 0), 0) / 1024;
     log(`  resources: ${droppedByAll.length} dropped by ALL dashboards (no dashboard references them), ${kb.toFixed(0)}KB.`);
