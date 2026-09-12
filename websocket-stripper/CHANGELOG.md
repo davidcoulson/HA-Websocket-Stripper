@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026.09.12.08 — 2026-09-12
+
+**The Configuration tab now explains itself.** Adds `translations/en.yaml`, so every option
+renders with a name and description in Home Assistant rather than a bare key like
+`resources_always_forward`. The warnings that matter are on that screen now: that
+`trim_resources` can fail silently, that `compress_websocket` should be left on, and that an
+entity *read* by panel-side JavaScript needs `always_forward` while one only *written* does
+not — `callService` resolves server-side. Two tests keep the file in step with the schema in
+both directions.
+
+**Documentation corrected.** The README and DOCS both claimed registries and custom-card
+resources "pass through untouched". That has not been true since registry trimming, and is
+less true again with resource trimming. Both now describe what is actually trimmed, and the
+README's example config lists the current options.
+
+
 ## 2026.09.12.07 — 2026-09-12
 
 Re-applies the withdrawal of the per-connection scoping half (see 2026.09.12.03) on top of

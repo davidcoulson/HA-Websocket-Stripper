@@ -110,8 +110,10 @@ keeps working out of the box.
 
 ## Notes & limits
 
-- Trimming only affects the **entity** stream (`get_states` / `subscribe_entities`).
-  Registries, lovelace config, translations, and the frontend JS bundles pass through.
+- Trimming affects the **entity** stream (`get_states` / `subscribe_entities`), the
+  **entity/device/area registries** (`trim_registries`, on by default) and optionally the
+  **Lovelace resource list** (`trim_resources`, off by default). Lovelace config,
+  translations and the frontend JS bundles always pass through untouched.
 - Cards referencing entities outside the allowlist will show "unavailable". The allowlist
   is computed generously (all views + template-referenced ids), but if something's
   missing add it via `always_forward`.
