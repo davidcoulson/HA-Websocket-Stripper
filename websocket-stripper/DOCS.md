@@ -103,6 +103,53 @@ rely on trusted-network auto-login, that's a reasonable local change; you then t
 port via the Network tab as usual. The default stays `true` so the documented kiosk login
 keeps working out of the box.
 
+## Statistics panel
+
+The add-on registers an Ingress panel, so once it is running there is a **Stripper** entry in
+the Home Assistant sidebar. (If it does not appear, turn on *Show in sidebar* on the add-on's
+own page — Supervisor stores that flag per install, and it stays off for add-ons that gained
+Ingress in an update.)
+
+The panel shows:
+
+- **clients connected right now** — address, how many entities each is subscribed to, how long
+  it has been connected, and its live update throughput;
+- **what got trimmed** — the number of times each payload was trimmed, the size Home Assistant
+  sent, the size the browser received, and the difference;
+- **allowlist size against instance size**, so "391 of 9,751" is visible at a glance.
+
+The same data is JSON at `http://<host>:8100/stats.json`. It is read-only and unauthenticated
+on the local port, so treat it as you would the add-on's own port. A `rest` sensor pointed at
+it will graph any of this over time:
+
+```yaml
+sensor:
+  - platform: rest
+    name: Stripper entities served
+    resource: http://homeassistant.local:8100/stats.json
+    value_template: "{{ value_json.allowlist.union }}"
+    json_attributes_path: "$.savings"
+    json_attributes: [before, after, savedPct]
+```
+
+### What the numbers mean
+
+Sizes are **uncompressed payload** — the bytes the browser has to parse. Fewer bytes than that
+cross the wire, because the websocket negotiates compression.
+
+`get_states` reports a genuine before/after: the proxy holds Home Assistant's full answer and
+its own trimmed answer in the same function, so the saving is a subtraction rather than an
+estimate.
+
+**Live update traffic is throughput, not a saving.** Home Assistant filters the event stream
+server-side from the `entity_ids` this add-on injects, so the untrimmed volume never exists
+anywhere and cannot be measured. Reporting a saving there would mean inventing a
+counterfactual. If you want that comparison, run once with `strip_entities: false` and compare
+the two throughput figures.
+
+A connection younger than a minute reports no rate at all rather than extrapolating its
+opening burst — the panel shows "—" until there is a full minute to divide by.
+
 ## Notes & limits
 
 - Trimming only affects the **entity** stream (`get_states` / `subscribe_entities`).

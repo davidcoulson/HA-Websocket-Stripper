@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0 — 2026-09-12
+
+**A statistics panel in the Home Assistant sidebar, and a JSON API behind it.**
+
+Until now the only evidence the add-on was doing anything was the log, which you read once
+something already looks wrong — so a correctly working install was indistinguishable from a
+broken one until a card went "unavailable". The panel shows connected clients, how big the
+allowlist is against the size of the instance, measured before/after sizes for what it trims,
+and live update throughput.
+
+Served over Ingress on its own port (8100), so it needs no configuration and no extra exposed
+port; the same data is at `http://<host>:8100/stats.json` for a `rest` sensor or a scrape.
+
+It reports only what it can honestly measure. `get_states` has a real before/after — the proxy
+holds HA's full answer and its own trimmed answer in the same function, so "saved" is a
+subtraction. The event stream does not: HA filters it server-side from the `entity_ids` the
+add-on injects, so the untrimmed volume never exists anywhere and cannot be measured. It is
+reported as throughput and never folded into the savings total.
+
 ## 0.2.3 — 2026-08-23
 
 Filter resolution and reverse-proxy fixes, all from reported issues.
