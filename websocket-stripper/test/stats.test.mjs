@@ -167,6 +167,43 @@ describe('stats API over HTTP', () => {
     assert.ok(s.allowlist.instanceEntities >= s.allowlist.union);
   });
 
+  it('still serves when the Supervisor port lookup fails', async () => {
+    // The add-on asks Supervisor which ingress port it was assigned. That call must never be
+    // able to hang or kill startup: an unreachable Supervisor has to fall back to the
+    // configured port, or a transient supervisor blip would cost the panel entirely.
+    const failPort = await getFreePort();
+    const proc = spawn(process.execPath, [PROXY], {
+      cwd: path.join(DIR, '..'),
+      env: {
+        ...process.env,
+        HA_BASE: mock.base,
+        HA_TOKEN: 'test-token',
+        DASH_PATHS: 'test-dash',
+        PORT: String(await getFreePort()),
+        STATS_PORT: String(failPort),
+        STRIP_ENTITIES: '1',
+        // Points the lookup at a host that does not resolve, so it errors rather than answers.
+        SUPERVISOR_TOKEN: 'not-a-real-token',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    proc.stdout.on('data', (b) => { out += b.toString(); });
+    proc.stderr.on('data', (b) => { out += b.toString(); });
+    try {
+      const deadline = Date.now() + 15000;
+      while (!/stats panel on/.test(out)) {
+        if (Date.now() > deadline) throw new Error(`stats server never came up\n${out}`);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.match(out, /could not ask Supervisor for the ingress port/);
+      const res = await httpGet(`http://127.0.0.1:${failPort}/stats.json`);
+      assert.equal(res.status, 200, 'fell back to the configured port');
+    } finally {
+      proc.kill();
+    }
+  });
+
   it('404s unknown paths instead of proxying them', async () => {
     const res = await httpGet(`http://127.0.0.1:${statsPort}/lovelace`);
     assert.equal(res.status, 404);

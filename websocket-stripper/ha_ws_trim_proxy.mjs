@@ -56,10 +56,38 @@ const HA_WS = HA_BASE.replace(/^http/, 'ws') + '/api/websocket';     // browser 
 const PORT = parseInt(process.env.PORT || OPT.port || '8099', 10);
 // The stats panel + JSON API get their own port, deliberately NOT PORT: everything on PORT is
 // the proxied Home Assistant namespace, and a dashboard whose url_path collided with a stats
-// path would be a confusing failure. Fixed rather than an option because Supervisor reads
-// `ingress_port` from config.yaml at install time, so an option the user could change would
-// silently break the sidebar panel.
-const STATS_PORT = parseInt(process.env.STATS_PORT || '8100', 10);
+// path would be a confusing failure.
+//
+// This is NOT an add-on option, and deliberately so. Supervisor proxies ingress to the
+// `ingress_port` from config.yaml, and that field is not settable through the add-on options
+// API (`SCHEMA_OPTIONS` accepts `ingress_panel` but not `ingress_port`). An option the user
+// could change would therefore leave Supervisor proxying the sidebar to a port nothing is
+// listening on — a silent 502 with no obvious cause.
+//
+// Instead the add-on asks Supervisor which port it was actually assigned and binds exactly
+// that. Under host networking the add-on binds the host port itself, so agreeing with
+// Supervisor is the only way to be reachable. It also means a maintainer can switch
+// config.yaml to `ingress_port: 0` — dynamic allocation from Supervisor's reserved range,
+// which cannot collide with a fixed port already in use — without touching this code.
+const STATS_PORT_FALLBACK = parseInt(process.env.STATS_PORT || '8100', 10);
+
+async function resolveStatsPort() {
+  // Dev / non-add-on: nothing to ask, use the fallback.
+  if (!process.env.SUPERVISOR_TOKEN) return STATS_PORT_FALLBACK;
+  try {
+    const res = await fetch('http://supervisor/addons/self/info', {
+      headers: { authorization: `Bearer ${process.env.SUPERVISOR_TOKEN}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const port = (await res.json())?.data?.ingress_port;
+    if (Number.isInteger(port) && port > 0) return port;
+    throw new Error(`no usable ingress_port (got ${JSON.stringify(port)})`);
+  } catch (e) {
+    log(`stats: could not ask Supervisor for the ingress port (${e.message}) — using ${STATS_PORT_FALLBACK}`);
+    return STATS_PORT_FALLBACK;
+  }
+}
 // How big the instance is, taken from the control connection's own get_states — which asks
 // for everything by definition. Lets the panel say "104 of 9,751", not just "104".
 const DASH_PATHS = toList(OPT.dashboards ?? (process.env.DASH_PATHS || process.env.DASH_PATH));
@@ -658,7 +686,9 @@ const statsServer = http.createServer((req, res) => {
 // A stats port that will not bind is an inconvenience, not a reason to take the proxy down
 // with it — the add-on's actual job is unaffected. Log and carry on, unlike PORT below.
 statsServer.on('error', (e) => logThrottled(`stats:${e.code || e.message}`, `stats server unavailable (${e.message}) — proxying is unaffected`));
-statsServer.listen(STATS_PORT, () => log(`stats panel on :${STATS_PORT} (ingress) — JSON at :${STATS_PORT}/stats.json`));
+resolveStatsPort().then((statsPort) => {
+  statsServer.listen(statsPort, () => log(`stats panel on :${statsPort} (ingress) — JSON at :${statsPort}/stats.json`));
+});
 
 server.listen(PORT, () => {
   log(`HA trim-proxy listening on :${PORT}  ->  ${HA_BASE}`);

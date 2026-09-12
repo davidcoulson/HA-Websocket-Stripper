@@ -119,7 +119,16 @@ The panel shows:
 - **allowlist size against instance size**, so "391 of 9,751" is visible at a glance.
 
 The same data is JSON at `http://<host>:8100/stats.json`. It is read-only and unauthenticated
-on the local port, so treat it as you would the add-on's own port. A `rest` sensor pointed at
+on the local port, so treat it as you would the add-on's own port.
+
+The port is not an add-on option, on purpose. Supervisor proxies ingress to the `ingress_port`
+declared in `config.yaml`, and that field cannot be changed through the add-on options API — so
+an option you could edit would leave Supervisor proxying the sidebar to a port nothing is
+listening on, which fails as a bare 502. Instead the add-on asks Supervisor which port it was
+assigned and binds exactly that, so the two can never disagree. The port it chose is in the
+first lines of the add-on log. (This also means `ingress_port: 0` — Supervisor allocating a
+port dynamically from its own reserved range — works without any code change, if 8100 ever
+turns out to collide in practice.) A `rest` sensor pointed at
 it will graph any of this over time:
 
 ```yaml

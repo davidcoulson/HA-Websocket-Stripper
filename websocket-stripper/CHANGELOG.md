@@ -11,7 +11,9 @@ allowlist is against the size of the instance, measured before/after sizes for w
 and live update throughput.
 
 Served over Ingress on its own port (8100), so it needs no configuration and no extra exposed
-port; the same data is at `http://<host>:8100/stats.json` for a `rest` sensor or a scrape.
+port; the same data is at `http://<host>:8100/stats.json` for a `rest` sensor or a scrape. The
+add-on binds whatever `ingress_port` Supervisor reports for it rather than assuming, so the two
+cannot drift apart — and `ingress_port: 0` (dynamic allocation) would work unchanged.
 
 It reports only what it can honestly measure. `get_states` has a real before/after — the proxy
 holds HA's full answer and its own trimmed answer in the same function, so "saved" is a
