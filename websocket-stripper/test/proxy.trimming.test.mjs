@@ -207,7 +207,7 @@ describe('resource trimming', () => {
 
   // Big bundles build their element names at runtime: ha-bambulab-cards.js is 3.2MB and the
   // string `ha-bambulab-print_status-card` appears nowhere in it, only `bambulab` and
-  // `print_status` separately. Requiring every fragment keeps that specific.
+  // `print_status` separately. Two rare fragments are ample evidence.
   it('matches a card whose element name is built at runtime, via its fragments', async () => {
     const cfg = { views: [{ cards: [{ type: 'custom:ha-bambulab-print_status-card', entity: 'light.living_room' }] }] };
     const m2 = await startMockHa({ configs: { 'bambu-dash': cfg } });
@@ -220,6 +220,53 @@ describe('resource trimming', () => {
         'all fragments present must count as a match');
       assert.ok(!urls.some((u) => u.includes('unrelated-widget')),
         'a bundle sharing no fragment must still be dropped');
+    } finally { px.kill(); await m2.close(); }
+  });
+
+  // REGRESSION, and the reason this option is worth being careful with. Mushroom registers its
+  // elements from template literals, so `mushroom-cover-card` appears nowhere in mushroom.js —
+  // and neither does the bare word `cover`. The matcher used to require EVERY fragment to be
+  // present and TWO distinctive ones, which a `<oneword>-<generic>-card` name can never
+  // satisfy, so the entire Mushroom family was dropped. Nothing logged an error; the cards
+  // simply rendered as errors on the dashboard.
+  //
+  // Its own mock: this needs a specific resource set, and mutating the shared fixtures changes
+  // the counts other tests in this file assert exactly.
+  it('keeps a bundle identified only by one rare fragment', async () => {
+    const m2 = await startMockHa({
+      configs: { 'mush-dash': { views: [{ cards: [
+        { type: 'custom:mushroom-cover-card', entity: 'cover.shade_left' },
+        // A second card with a plain literal match. Without it the dashboard would match
+        // NOTHING, and the trimmer forwards every resource rather than send a dashboard an
+        // empty list — so the drop this test is about would be masked by that safety net and
+        // the test would pass for the wrong reason.
+        { type: 'custom:plainthing-card', entity: 'light.living_room' },
+      ] }] } },
+      resources: [
+        { id: 'm1', type: 'module', url: '/res/mushroom.js' },
+        { id: 'm2', type: 'module', url: '/res/plain.js' },
+        { id: 'm3', type: 'module', url: '/res/unrelated.js' },
+      ],
+      resourceBodies: {
+        // Exactly how Mushroom ships: the name is assembled at registration time, so neither
+        // the full element name nor the generic half `cover` is in the file.
+        '/res/mushroom.js': 'const P="mushroom";for(const t of TYPES)customElements.define(`${P}-${t}-card`,C);',
+        '/res/plain.js': 'customElements.define("plainthing-card",X);',
+        // Shares only the generic word `card`, which all three bodies contain — so it is too
+        // common to identify anything and must not carry a match on its own.
+        '/res/unrelated.js': 'customElements.define("zzz-card",X);',
+      },
+    });
+    const p2 = await getFreePort();
+    const px = spawnProxy({ mock: m2, dashPaths: 'mush-dash', port: p2, extraEnv: { TRIM_RESOURCES: '1' } });
+    try {
+      await px.waitForLog(/union allowlist for/);
+      const urls = await resourcesFor(p2);
+      assert.ok(urls.includes('/res/plain.js'), 'the literal match is kept, so trimming is live');
+      assert.ok(urls.includes('/res/mushroom.js'),
+        `a bundle naming none of its own cards must still be kept; kept: ${JSON.stringify(urls)}`);
+      assert.ok(!urls.includes('/res/unrelated.js'),
+        `and a shared generic word must not keep a bundle; kept: ${JSON.stringify(urls)}`);
     } finally { px.kill(); await m2.close(); }
   });
 

@@ -678,20 +678,41 @@ function cardFragments(type) {
 let FRAG_DF = new Map();
 let FRAG_DF_MAX = 0;
 const isDistinctive = (f) => (FRAG_DF.get(f) || 0) <= FRAG_DF_MAX;
+// A fragment so rare it effectively names one bundle. Kept separate from "distinctive"
+// because the evidence is much stronger: `mushroom` appears in 2 files out of 48, so a bundle
+// containing it is almost certainly the Mushroom bundle, whereas `cover` tells you nothing.
+let FRAG_RARE_MAX = 2;
+const isRare = (f) => (FRAG_DF.get(f) || 0) <= FRAG_RARE_MAX;
 
-// Does this body provide this card type?
+// Does this bundle look like it provides `type`?
 //
-// The literal name is the strong signal. The fragment fallback exists for bundles that
-// BUILD their element names at runtime: `ha-bambulab-cards.js` is 3.2MB, a dashboard
-// renders `ha-bambulab-print_status-card`, and that string appears nowhere in the file —
-// only `bambulab` and `print_status` separately. Every fragment must be present, and at
-// least two of them must be distinctive, so a pair of common words can never carry a match.
+// The literal name is the strong signal. The fragment fallback exists for bundles that BUILD
+// their element names at runtime: `ha-bambulab-cards.js` is 3.2MB, a dashboard renders
+// `ha-bambulab-print_status-card`, and that string appears nowhere in the file — only
+// `bambulab` and `print_status` separately.
+//
+// Two earlier rules made a very common case impossible, and both are gone:
+//
+//   - requiring EVERY fragment to be present. Mushroom registers its elements from template
+//     literals, so `mushroom-cover-card` appears nowhere in `mushroom.js` — and neither does
+//     the bare word `cover`. One missing generic word discarded the bundle even though the
+//     near-unique `mushroom` was sitting right there.
+//   - requiring TWO distinctive fragments, which no `<oneword>-<generic>-card` name can ever
+//     satisfy, because it only has one distinctive word to give.
+//
+// Together they silently dropped the entire Mushroom family — one of the most widely
+// installed card sets there is — with no error anywhere, just blank cards on the dashboard.
+//
+// Now: one RARE fragment carries a match on its own; otherwise fall back to two merely
+// distinctive ones. Erring toward keeping is the right bias here, because the two failure
+// modes are not symmetric — a resource kept needlessly costs some bytes, a resource wrongly
+// dropped breaks a card and says nothing about why.
 function cardMatchesBody(type, cached) {
   if (cached.literal.has(type)) return true;
-  const frags = cardFragments(type);
-  if (frags.length < 2) return false;
-  if (!frags.every((f) => cached.frags.has(f))) return false;
-  return frags.filter(isDistinctive).length >= 2;
+  const present = cardFragments(type).filter((f) => cached.frags.has(f));
+  if (!present.length) return false;
+  if (present.some(isRare)) return true;
+  return present.filter(isDistinctive).length >= 2;
 }
 
 // An icon namespace is matched two ways, and it needs both.
@@ -775,6 +796,10 @@ async function buildResources(rpc, keysByDash) {
     FRAG_DF.set(f, readable.filter((r) => RESOURCE_CACHE.get(r.url).frags.has(f)).length);
   }
   FRAG_DF_MAX = Math.max(1, Math.floor(readable.length * 0.25));
+  // Both cutoffs scale with how many resources the instance has, so a small install and a
+  // large one behave the same way. 5% is "this word appears in almost nothing", with a floor
+  // of 2 so a tiny instance still has a workable notion of rare.
+  FRAG_RARE_MAX = Math.max(2, Math.floor(readable.length * 0.05));
   const common = [...unionFrags].filter((f) => !isDistinctive(f));
   if (common.length) {
     log(`  resources: ${common.length} fragment(s) too common to identify a card (>${FRAG_DF_MAX} of ${readable.length}): ${common.sort().join(', ')}`);

@@ -165,6 +165,24 @@ resources basement-stairs-panel: 8/45 kept (2536KB), 37 dropped (18471KB)
     drop   3159KB /bambu_lab/ha-bambulab-cards.js
 ```
 
+#### How a resource is matched
+
+The reliable signal is the card's element name written literally in the file. Plenty of card
+packs never write their own names down, though — Mushroom assembles its elements from a
+template literal, so `mushroom-cover-card` appears nowhere in `mushroom.js`. For those, the
+card type is split on `-` and matched fragment by fragment, and how much weight a fragment
+carries depends on how many resources contain it, measured on your instance rather than
+guessed from a stop-word list:
+
+- a **rare** fragment (in ≤5% of resources) identifies a bundle on its own — `mushroom` is in
+  2 files out of 48, so a file containing it is almost certainly the Mushroom bundle;
+- otherwise **two** merely uncommon fragments are needed;
+- a fragment in more than a quarter of all resources identifies nothing, and is ignored. The
+  log lists these, and `card`, `grid`, `layout` and `entity` are usually among them.
+
+The bias is deliberately toward keeping: a resource kept needlessly costs bytes, a resource
+wrongly dropped breaks a card and explains nothing.
+
 Then look at the dashboard. Anything that looks wrong goes in `resources_always_forward`.
 Three classes of plugin reliably need it, because none registers a card the config names.
 The first two announce themselves; **the third does not**:
