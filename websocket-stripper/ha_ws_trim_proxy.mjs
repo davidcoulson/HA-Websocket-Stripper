@@ -27,7 +27,7 @@
 
 import http from 'node:http';
 import fs from 'node:fs';
-import httpProxy from 'http-proxy';
+import { createProxyServer } from 'httpxy';
 import { WebSocketServer, WebSocket } from 'ws';
 import { extractEntities, collectTemplates, expandGroupMembers } from './lovelace_extract.mjs';
 
@@ -107,7 +107,7 @@ function logThrottled(key, msg) {
 
 // Last-resort safety net. An HA restart resets every in-flight socket at once (camera
 // streams, Assist pipelines, the browser's own connections), and a socket that errors before
-// http-proxy has attached its handlers reaches Node as an unhandled 'error' event — which
+// the proxy library has attached its handlers reaches Node as an unhandled 'error' event — which
 // killed the whole add-on (`throw er` / `read ECONNRESET`), turning an HA reboot into a
 // crash-restart loop. Transient network errnos are logged and swallowed; anything else is a
 // real bug and still exits loudly.
@@ -431,7 +431,7 @@ function startController() {
 // ---- HTTP passthrough to HA ----
 // xfwd:true adds X-Forwarded-For/Proto/Host so HA's trusted_networks auth provider
 // sees the real browser IP (needs http.use_x_forwarded_for + trusted_proxies on HA side).
-const proxy = httpProxy.createProxyServer({ target: HA_BASE, changeOrigin: true, ws: false, autoRewrite: true, xfwd: true });
+const proxy = createProxyServer({ target: HA_BASE, changeOrigin: true, ws: false, autoRewrite: true, xfwd: true });
 // Node reports dual-stack client IPs as IPv4-mapped IPv6 (e.g. ::ffff:192.168.5.247).
 // HA's trusted_networks auth provider matches plain IPv4 subnets, and a mapped address
 // won't match an IPv4 network — so normalize X-Forwarded-For to bare IPv4, or
@@ -439,14 +439,21 @@ const proxy = httpProxy.createProxyServer({ target: HA_BASE, changeOrigin: true,
 //
 // Normalize IN PLACE, preserving the chain. This used to `setHeader('x-forwarded-for', ip)`,
 // replacing the whole chain with our immediate peer — which broke every setup with another
-// reverse proxy in front (issue #9). http-proxy's xfwd APPENDS our hop to all three headers,
-// so behind e.g. Caddy HA received:
-//     X-Forwarded-For:   <client>,<caddy>      (2 entries — then flattened by us to 1)
+// reverse proxy in front (issue #9). Behind e.g. Caddy, HA received:
+//     X-Forwarded-For:   <client>              (a 2-entry chain, flattened by us to 1)
 //     X-Forwarded-Proto: https,http            (2 entries)
 // and HA's forwarded middleware raises HTTPBadRequest on
 //     `len(forwarded_proto) not in (1, len(forwarded_for))`
-// -> a hard 400 on every request. Keeping the chain intact keeps the counts in step, and
-// preserves the real client IP through the upstream proxy instead of hiding it behind Caddy.
+// -> a hard 400 on every request. What HA actually enforces is that the For and Proto chains
+// agree in LENGTH, so the fix is to leave the chain intact and only normalize its entries.
+// That also preserves the real client IP through the upstream proxy instead of hiding it
+// behind Caddy.
+//
+// The two proxy libraries differ here, and both satisfy the rule: node-http-proxy APPENDED
+// our hop to all three headers, while httpxy sets each only when ABSENT. Either way For and
+// Proto stay in step. httpxy's behaviour additionally leaves us transparent to whatever the
+// edge proxy set, so HA sees exactly Caddy's chain rather than an extra hop it may not have
+// listed in `trusted_proxies`.
 const normalizeXff = (v) => String(v).split(',').map((s) => s.trim().replace(/^::ffff:/, '')).filter(Boolean).join(', ');
 proxy.on('proxyReq', (proxyReq, req) => {
   const xff = proxyReq.getHeader('x-forwarded-for') ?? req.headers['x-forwarded-for'];
@@ -466,7 +473,10 @@ proxy.on('error', (e, req, res) => {
     else if (res && typeof res.destroy === 'function') res.destroy();   // ws upgrade socket
   } catch {}
 });
-const server = http.createServer((req, res) => proxy.web(req, res));
+// httpxy's web()/ws() return promises. The 'error' handler above already deals with the
+// failure; without a catch here the same failure ALSO surfaces as an unhandled rejection,
+// which is a process-level crash — exactly the class of bug the socket guard exists to stop.
+const server = http.createServer((req, res) => { proxy.web(req, res).catch(() => {}); });
 
 // ---- websocket upgrades ----
 // We intercept ONLY /api/websocket (the entity firehose) to trim it. EVERY other ws
@@ -475,7 +485,7 @@ const server = http.createServer((req, res) => proxy.web(req, res));
 // branch) broke camera streams with ws close code 1006.
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
-  // A raw upgrade socket arrives with NO 'error' listener, and http-proxy only attaches one
+  // A raw upgrade socket arrives with NO 'error' listener, and the proxy library only attaches one
   // once HA has answered 101 (see ws-incoming.js). Anything that errors in that window — an
   // HA restart resetting an in-flight camera/Assist stream, a kiosk abandoning a retry —
   // reaches Node as an unhandled 'error' event and killed the add-on outright. Claim it
@@ -505,7 +515,11 @@ server.on('upgrade', (req, socket, head) => {
     // Keyed on the path, not req.url: camera stream URLs carry a per-request signature, so
     // keying on the whole thing would defeat the throttle (and grow the map) during a retry storm.
     logThrottled(`passthrough:${req.url.split('?')[0]}`, `ws upgrade passthrough -> HA: ${req.url}`);
-    proxy.ws(req, socket, head);
+    // Argument order changed with the library: node-http-proxy was ws(req, socket, head),
+    // httpxy is ws(req, socket, options, head). Passing `head` third spreads a Buffer into
+    // the request options and the upgrade never completes — silently, with no error, just a
+    // socket that hangs. Hence the explicit `undefined`.
+    proxy.ws(req, socket, undefined, head).catch(() => {});
   }
 });
 

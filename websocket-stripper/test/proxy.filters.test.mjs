@@ -182,28 +182,43 @@ describe('#9 the X-Forwarded-For chain survives an upstream proxy', () => {
   const get = (headers) => new Promise((resolve, reject) => {
     const req = http.get({ host: '127.0.0.1', port, path: '/x', headers }, (res) => {
       res.resume();
-      res.on('end', () => resolve(res.headers['x-echo-xff']));
+      res.on('end', () => resolve({
+        xff: res.headers['x-echo-xff'],
+        proto: res.headers['x-echo-xfproto'],
+      }));
     });
     req.on('error', reject);
   });
 
-  it('appends our hop instead of replacing the chain', async () => {
-    // What Caddy would send. Flattening this to one entry is what produced HA's 400,
-    // because http-proxy still appends a second entry to X-Forwarded-Proto.
-    const xff = await get({ 'x-forwarded-for': '203.0.113.7' });
-    const parts = xff.split(',').map((s) => s.trim());
-    assert.equal(parts[0], '203.0.113.7', `real client IP preserved, got "${xff}"`);
-    assert.equal(parts.length, 2, `chain kept both hops, got "${xff}"`);
+  const chain = (v) => String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+
+  // The bug in #9 was never "a hop went missing" — it was the chain being FLATTENED. We
+  // replaced X-Forwarded-For with our immediate peer while X-Forwarded-Proto still carried
+  // two entries, and HA's forwarded middleware rejects exactly that:
+  //     `len(forwarded_proto) not in (1, len(forwarded_for))`   ->   400 on every request.
+  //
+  // So the property to pin is that the two chains AGREE IN LENGTH, plus the real client
+  // staying at the head. Asserting a specific entry COUNT instead would pin the proxy
+  // library rather than the requirement: node-http-proxy appended our hop to all three
+  // headers, httpxy sets each only when absent, and both keep For and Proto in step — so a
+  // count assertion fails on a library swap that never broke the thing #9 was about.
+  it('keeps For and Proto in step behind an upstream proxy, real client at the head', async () => {
+    // What Caddy would send.
+    const r = await get({ 'x-forwarded-for': '203.0.113.7', 'x-forwarded-proto': 'https' });
+    const fors = chain(r.xff), protos = chain(r.proto);
+    assert.equal(fors[0], '203.0.113.7', `real client IP preserved, got "${r.xff}"`);
+    assert.ok(protos.length === 1 || protos.length === fors.length,
+      `HA would 400: ${fors.length} For entries vs ${protos.length} Proto entries`);
   });
 
   it('still normalizes IPv4-mapped IPv6 to bare IPv4', async () => {
-    const xff = await get({ 'x-forwarded-for': '::ffff:192.168.5.247' });
+    const { xff } = await get({ 'x-forwarded-for': '::ffff:192.168.5.247' });
     assert.match(xff, /(^|[\s,])192\.168\.5\.247([\s,]|$)/, `mapped prefix stripped, got "${xff}"`);
     assert.doesNotMatch(xff, /::ffff:/);
   });
 
   it('a direct client still yields a single entry', async () => {
-    const xff = await get({});
+    const { xff } = await get({});
     assert.equal(xff.split(',').length, 1, `got "${xff}"`);
     assert.doesNotMatch(xff, /::ffff:/);
   });
