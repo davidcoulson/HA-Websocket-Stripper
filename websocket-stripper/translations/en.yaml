@@ -41,9 +41,12 @@ configuration:
     name: Trim Lovelace resources (custom cards)
     description: >-
       Sends each dashboard only the custom cards it uses. Resources are instance-wide in
-      Home Assistant, so every kiosk normally parses every card you have installed. OFF BY
-      DEFAULT because a wrongly dropped resource can fail SILENTLY — see the Documentation
-      tab before enabling, and read the "dropped by ALL dashboards" block in the log.
+      Home Assistant, so every kiosk normally parses every card you have installed. Off by
+      default. Most mistakes are loud and easy to find — a missing card renders as "Custom
+      element doesn't exist", a missing icon pack shows blank icons. The exception, and the
+      reason this is off by default, is a resource that renders nothing but runs on load: an
+      idle timer, a pop-up, a heartbeat. Dropping one of those is INVISIBLE. The "dropped by
+      ALL dashboards" block in the log is where such a resource would appear.
   resources_always_forward:
     name: Always send these resources
     description: >-
